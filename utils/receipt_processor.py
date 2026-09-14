@@ -11,6 +11,12 @@ from docx.enum.text import WD_COLOR_INDEX, WD_LINE_SPACING
 from docx.shared import Pt
 from PySide6.QtCore import QThread, Signal
 from extend.matcher_config import MatcherConfig
+from utils.runtime_logger import log_error
+from utils.task_state import (
+    begin_heavy_task_if_large,
+    collect_existing_file_paths,
+    end_heavy_task,
+)
 
 
 class ReceiptWorker(QThread):
@@ -32,6 +38,11 @@ class ReceiptWorker(QThread):
         RuntimeLogger.set_project(self.project_name)
         RuntimeLogger.log("开始生成回单...")
 
+        # 【新增】大项目检测：输入报告超阈值则提升线程优先级并暂缓历史页扫描
+        self._heavy_task = begin_heavy_task_if_large(
+            collect_existing_file_paths(self.data), self.project_name, kind="receipt"
+        )
+
         try:
             # 检查是否为批量任务
             is_batch = self.data.get("is_batch", False)
@@ -45,7 +56,7 @@ class ReceiptWorker(QThread):
                         self.item_finished.emit(i, result)
                         last_result = result
                     except Exception as sub_e:
-                        print(f"批量任务第 {i} 项生成失败: {sub_e}")
+                        log_error(f'批量任务第 {i} 项生成失败: {sub_e}')
                         self.item_finished.emit(i, {"error": str(sub_e)})
 
                 # 全部完成后发送最后的结果 (or a summary)
@@ -59,6 +70,9 @@ class ReceiptWorker(QThread):
 
             traceback.print_exc()
             self.error.emit(str(e))
+        finally:
+            # 【新增】结束大任务标记并恢复线程优先级
+            end_heavy_task(getattr(self, "_heavy_task", False), kind="receipt")
 
 
 class ReceiptProcessor:
@@ -66,6 +80,24 @@ class ReceiptProcessor:
 
     @staticmethod
     def generate(data):
+        # [NEW] 记录本次上传的原始材料路径，供历史项目页"上传文件位置"使用
+        try:
+            import json as _json
+
+            config = MatcherConfig.load()
+            _base = config.get("storage", {}).get("receipt", ".")
+            os.makedirs(_base, exist_ok=True)
+            _inputs = {
+                k: data.get(k)
+                for k in ("eval_report_path", "eval_consent_path", "tasks", "is_merge")
+            }
+            with open(
+                os.path.join(_base, "inputs.json"), "w", encoding="utf-8"
+            ) as _f:
+                _json.dump(_inputs, _f, ensure_ascii=False, default=str)
+        except Exception:
+            pass
+
         is_merge = data.get("is_merge", False)
 
         if is_merge and data.get("file_groups"):
@@ -220,6 +252,26 @@ class ReceiptProcessor:
                 final_path = os.path.join(output_dir, f"{base}({counter}){ext}")
                 counter += 1
 
+        # [FIX] 单项目模式：材料清单随产物文件一一对应（不再共用根目录 inputs.json，
+        # 避免多次回单互相覆盖、旧记录指向最新材料）
+        try:
+            import json as _json
+
+            _stem = os.path.splitext(os.path.basename(final_path))[0]
+            with open(
+                os.path.join(output_dir, f"{_stem}-inputs.json"), "w", encoding="utf-8"
+            ) as _f:
+                _json.dump(
+                    {
+                        "eval_report_path": data.get("eval_report_path"),
+                        "eval_consent_path": data.get("eval_consent_path"),
+                    },
+                    _f,
+                    ensure_ascii=False,
+                )
+        except Exception:
+            pass
+
         # 6. 回写结果到评估报告 PQR 列 (使用副本回写以避免被占用)
         if data.get("eval_report_path"):
             try:
@@ -358,6 +410,30 @@ class ReceiptProcessor:
         task_dir = os.path.join(base_output_dir, folder_name)
         if not os.path.exists(task_dir):
             os.makedirs(task_dir)
+
+        # [NEW] 合并模式：把材料清单写进本次结果子目录
+        try:
+            import json as _json
+
+            with open(
+                os.path.join(task_dir, "inputs.json"), "w", encoding="utf-8"
+            ) as _f:
+                _json.dump(
+                    {
+                        k: data.get(k)
+                        for k in (
+                            "eval_report_path",
+                            "eval_consent_path",
+                            "file_groups",
+                            "is_merge",
+                        )
+                    },
+                    _f,
+                    ensure_ascii=False,
+                    default=str,
+                )
+        except Exception:
+            pass
 
         # 调试日志：列出文件组
         for gk, fv in file_groups.items():
@@ -1034,6 +1110,15 @@ class ReceiptProcessor:
                         not clean_val
                         or "nan" in clean_val.lower()
                         or "合计" in clean_val
+                        or "总计" in clean_val
+                    ):
+                        continue
+                    # [FIX] 排除表头/汇总类文字（如列头"复用度"包含"复用"导致多计 1）
+                    if "复用度" in clean_val or "开发类型" in clean_val or clean_val in (
+                        "类型",
+                        "模式",
+                        "小计",
+                        "汇总",
                     ):
                         continue
 

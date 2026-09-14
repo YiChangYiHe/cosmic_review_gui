@@ -7,6 +7,7 @@ import tempfile
 import shutil
 import sys
 from pathlib import Path
+# 初评报告路径统一由 utils/initial_review_report.py 生成（在各校验函数内部按需导入）
 
 # 确保可以导入 extend 目录下的模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,31 +21,80 @@ from utils.report_generator import ReportGenerator
 from utils.runtime_logger import RuntimeLogger  # ✅ 新增导入
 from datetime import datetime
 import json
+from utils.runtime_logger import log_debug, log_error, log_info, log_warn
 
 
 class DocumentProcessor:
     """文档处理类，用于提取 Word 和 Excel 的内容结构"""
 
     # 类级缓存
+    # _temp_files: [(路径, 属主项目名或None)]；属主来自线程局部项目上下文，
+    #              并行任务只清理自己的临时文件，避免删掉其他运行中任务的文件
     _temp_files = []
     _cache = {}
 
     @staticmethod
-    def clear_cache():
-        """清理缓存和临时文件"""
-        # 清理临时文件
-        for temp_file in DocumentProcessor._temp_files:
+    def _register_temp(path):
+        """注册临时文件/目录，属主为当前线程的项目名（未设置则为 None）"""
+        try:
+            from utils.runtime_logger import RuntimeLogger
+            owner = RuntimeLogger.get_project()
+        except Exception:
+            owner = None
+        DocumentProcessor._temp_files.append((path, owner))
+
+    @staticmethod
+    def clear_cache(owner=None, max_age_hours=None):
+        """
+        清理临时文件和缓存。
+
+        :param owner: 只清理指定属主（任务）注册的临时文件 —— 并行任务安全
+        :param max_age_hours: 只清理早于该时长的陈旧临时文件 —— 跨次运行清理
+        :return: 两者都未指定时执行全量清理（兼容旧行为；并行任务运行期间禁止调用）
+        """
+        import time as _time
+        cutoff = _time.time() - max_age_hours * 3600 if max_age_hours else None
+        remaining = []
+        for entry in DocumentProcessor._temp_files:
+            if isinstance(entry, tuple):
+                temp_file, entry_owner = entry
+            else:  # 兼容旧格式（纯路径）
+                temp_file, entry_owner = entry, None
+            if owner is not None and entry_owner != owner:
+                remaining.append(entry)
+                continue
+            if cutoff is not None:
+                try:
+                    if os.path.getmtime(temp_file) >= cutoff:
+                        # 陈旧度不满足：保留（可能正被其他任务使用）
+                        remaining.append(entry)
+                        continue
+                except OSError:
+                    remaining.append(entry)
+                    continue
             try:
                 if os.path.exists(temp_file):
                     if os.path.isfile(temp_file):
                         os.remove(temp_file)
                     elif os.path.isdir(temp_file):
-                        shutil.rmtree(temp_file)
+                        shutil.rmtree(temp_file, ignore_errors=True)
             except Exception as e:
-                print(f"[CLEANUP] 无法删除临时文件 {temp_file}: {e}")
+                # 文件可能正被其他任务/COM占用：保留登记，留待下次清理
+                remaining.append(entry)
+                try:
+                    from utils.runtime_logger import RuntimeLogger
+                    RuntimeLogger.log(f"[CLEANUP] 无法删除临时文件 {temp_file}: {e}", "DEBUG")
+                except Exception:
+                    pass
 
-        DocumentProcessor._temp_files = []
-        DocumentProcessor._cache = {}
+        DocumentProcessor._temp_files = remaining
+        if owner is None and max_age_hours is None:
+            DocumentProcessor._cache = {}
+
+    @staticmethod
+    def cleanup_stale_temp(max_age_hours=6):
+        """清理历史运行遗留的陈旧临时文件（并行安全：只动超过时限的文件）"""
+        DocumentProcessor.clear_cache(max_age_hours=max_age_hours)
 
     @staticmethod
     def _convert_doc_to_docx(doc_path):
@@ -85,7 +135,7 @@ class DocumentProcessor:
             )
             shutil.copy2(abs_doc_path, tmp_copy_path)
 
-            print(f"[CONVERT] 正在打开副本: {tmp_copy_path}")
+            log_info(f'[CONVERT] 正在打开副本: {tmp_copy_path}')
 
             doc = word.Documents.Open(
                 FileName=tmp_copy_path,
@@ -106,9 +156,7 @@ class DocumentProcessor:
             last_err = None
             for i in range(max_retries):
                 try:
-                    print(
-                        f"[CONVERT] 正在执行转存 (尝试 {i+1}/{max_retries}): {tmp_result_path}"
-                    )
+                    log_info(f'[CONVERT] 正在执行转存 (尝试 {i + 1}/{max_retries}): {tmp_result_path}')
                     # FileFormat=16 是 wdFormatXMLDocument
                     doc.SaveAs2(tmp_result_path, FileFormat=16)
                     break
@@ -117,7 +165,8 @@ class DocumentProcessor:
                     # 如果错误码是 -2147418111 (Call rejected)，则进行重试
                     if "拒绝接收呼叫" in str(e) or "-2147418111" in str(e):
                         wait_time = 0.5 * (i + 1)
-                        print(f"[CONVERT] Word 忙碌，{wait_time}s 后重试...")
+                        log_warn(f'[CONVERT] Word 忙碌，{wait_time}s 后重试...')
+
                         time.sleep(wait_time)
                         continue
                     else:
@@ -132,7 +181,7 @@ class DocumentProcessor:
             return tmp_result_path
 
         except Exception as e:
-            print(f"[CONVERT] ❌ 转换最终失败: {e}")
+            log_error(f'[CONVERT] ❌ 转换最终失败: {e}')
             import traceback
 
             traceback.print_exc()
@@ -227,7 +276,7 @@ class DocumentProcessor:
             except:
                 total_paras = 0
 
-            print(f"[PROCESS] 文档预估段落数: {total_paras}，开始提取...")
+            log_debug(f'[PROCESS] 文档预估段落数: {total_paras}，开始提取...')
 
             # 初始化进度计数器
             p_idx = 0
@@ -248,7 +297,7 @@ class DocumentProcessor:
                             if total_paras > 0
                             else f"[PROCESS] 已提取 {p_idx} 段"
                         )
-                        print(progress_msg)
+                        log_info(progress_msg)
                         if progress_callback:
                             percent = (
                                 int((p_idx / total_paras) * 100)
@@ -408,11 +457,11 @@ class DocumentProcessor:
                 level="INFO",
             )
 
-            print(f"[STABLE-EXTRACT] ✓ 成功提取 {len(sections)} 个章节")
+            log_info(f'[STABLE-EXTRACT] ✓ 成功提取 {len(sections)} 个章节')
             return sections
 
         except Exception as e:
-            print(f"[STABLE-EXTRACT] ❌ 失败: {e}")
+            log_error(f'[STABLE-EXTRACT] ❌ 失败: {e}')
             import traceback
 
             traceback.print_exc()
@@ -440,30 +489,29 @@ class DocumentProcessor:
                 temp_docx = DocumentProcessor._convert_doc_to_docx(file_path_str)
                 if temp_docx:
                     # 记录临时文件供后续清理
-                    DocumentProcessor._temp_files.append(temp_docx)
+                    DocumentProcessor._register_temp(temp_docx)
                     return Document(temp_docx)
                 else:
                     raise ValueError(f"Failed to convert .doc file: {file_path_str}")
             else:
                 return Document(file_path_str)
         except Exception as e:
-            print(f"[ERROR] 加载 Word 文档失败: {file_path_str} - {e}")
+            log_error(f'[ERROR] 加载 Word 文档失败: {file_path_str} - {e}')
             raise
 
     @staticmethod
     def load_excel_workbook(file_path, cache=True):
-        """加载 Excel 工作簿"""
+        """加载 Excel 工作簿（cache 参数兼容保留；工作簿缓存只写不读且大文件下
+        纯属内存泄漏，已停用存储，每次按需重新加载）"""
         file_path_str = str(file_path)
         try:
             # 使用 openpyxl 或 pandas 加载 Excel
             import openpyxl
 
             wb = openpyxl.load_workbook(file_path_str, data_only=False)
-            if cache:
-                DocumentProcessor._cache[file_path_str] = wb
             return wb
         except Exception as e:
-            print(f"[ERROR] 加载 Excel 工作簿失败: {file_path_str} - {e}")
+            log_error(f'[ERROR] 加载 Excel 工作簿失败: {file_path_str} - {e}')
             raise
 
     @staticmethod
@@ -519,7 +567,7 @@ class DocumentProcessor:
                 except:
                     continue
         except Exception as e:
-            print(f"[EXTRACT-DOCX] 章节定位逻辑异常: {e}")
+            log_error(f'[EXTRACT-DOCX] 章节定位逻辑异常: {e}')
 
         # 2. 兜底：如果章节内没找到，或者文档不是 .docx，则通过 Zip 提取所有媒体
         if not image_paths:
@@ -535,10 +583,10 @@ class DocumentProcessor:
                                     f.write(zf.read(item))
                                 image_paths.append(img_path)
             except Exception as e:
-                print(f"[EXTRACT-DOCX] ZIP全量提取失败: {e}")
+                log_error(f'[EXTRACT-DOCX] ZIP全量提取失败: {e}')
 
         # 记录临时目录以便后续清理
-        DocumentProcessor._temp_files.append(temp_dir)
+        DocumentProcessor._register_temp(temp_dir)
         # 去重返回
         return sorted(list(set(image_paths)))
 
@@ -567,11 +615,11 @@ class DocumentProcessor:
         else:
             doc_name = os.path.basename(str(file_path))
 
-        print(f"[DOC-PROCESS-START] 开始处理文档: {doc_name}")
+        log_info(f'[DOC-PROCESS-START] 开始处理文档: {doc_name}')
 
         # 如果启用稳定大纲提取模式 (基于 Word COM)
         if use_stable and isinstance(file_path, (str, Path)):
-            print(f"[DOC-PROCESS] 启用稳定大纲提取模式: {file_path}")
+            log_info(f'[DOC-PROCESS] 启用稳定大纲提取模式: {file_path}')
             stable_start = time.time()
 
             try:
@@ -582,20 +630,16 @@ class DocumentProcessor:
 
                 if result and len(result) > 0:
                     total_duration = time.time() - start_time
-                    print(
-                        f"[DOC-PROCESS-SUCCESS] 稳定大纲提取成功: {len(result)}项, 耗时: {stable_duration:.2f}秒, 总耗时: {total_duration:.2f}秒"
-                    )
+                    log_info(f'[DOC-PROCESS-SUCCESS] 稳定大纲提取成功: {len(result)}项, 耗时: {stable_duration:.2f}秒, 总耗时: {total_duration:.2f}秒')
                     return result
                 else:
-                    print(f"[DOC-PROCESS-FALLBACK] 稳定大纲提取无结果，回退到传统方法")
+                    log_info(f'[DOC-PROCESS-FALLBACK] 稳定大纲提取无结果，回退到传统方法')
             except Exception as e:
                 stable_duration = time.time() - stable_start
-                print(
-                    f"[DOC-PROCESS-ERROR] 稳定大纲提取失败(耗时{stable_duration:.2f}秒): {e}"
-                )
-                print(f"[DOC-PROCESS-FALLBACK] 回退到传统方法")
+                log_error(f'[DOC-PROCESS-ERROR] 稳定大纲提取失败(耗时{stable_duration:.2f}秒): {e}')
+                log_error(f'[DOC-PROCESS-FALLBACK] 回退到传统方法')
 
-        print(f"[DOC-PROCESS] 开始直接大纲级别分析...")
+        log_info(f'[DOC-PROCESS] 开始直接大纲级别分析...')
 
         temp_docx = None
         doc = None
@@ -605,40 +649,32 @@ class DocumentProcessor:
         if hasattr(file_path, "paragraphs") and hasattr(file_path, "element"):
             # 这是一个 Document 对象
             doc = file_path
-            print(
-                f"[DOC-PROCESS] 使用传入的Document对象，段落数: {len(doc.paragraphs)}"
-            )
+            log_info(f'[DOC-PROCESS] 使用传入的Document对象，段落数: {len(doc.paragraphs)}')
         else:
             # 统一转为字符串处理，防止 pathlib.Path 对象导致 lower() 失败
             file_path_str = str(file_path)
-            print(f"[DOC-PROCESS] 正在打开文件: {file_path_str}")
+            log_info(f'[DOC-PROCESS] 正在打开文件: {file_path_str}')
             if file_path_str.lower().endswith(".doc"):
-                print(f"[DOC-PROCESS] 检测到.doc格式，启动COM转换...")
+                log_info(f'[DOC-PROCESS] 检测到.doc格式，启动COM转换...')
                 convert_start = time.time()
                 temp_docx = DocumentProcessor._convert_doc_to_docx(file_path_str)
                 convert_duration = time.time() - convert_start
                 if not temp_docx:
-                    print(
-                        f"[DOC-PROCESS] ❌ .doc转换失败(耗时{convert_duration:.2f}秒)"
-                    )
+                    log_error(f'[DOC-PROCESS] ❌ .doc转换失败(耗时{convert_duration:.2f}秒)')
                     return []
-                print(
-                    f"[DOC-PROCESS] .doc转换成功(耗时{convert_duration:.2f}秒)，临时文件: {temp_docx}"
-                )
+                log_info(f'[DOC-PROCESS] .doc转换成功(耗时{convert_duration:.2f}秒)，临时文件: {temp_docx}')
                 doc_to_read = temp_docx
             else:
                 doc_to_read = file_path_str
 
-            print(f"[DOC-PROCESS] 正在加载docx对象: {doc_to_read}")
+            log_info(f'[DOC-PROCESS] 正在加载docx对象: {doc_to_read}')
             load_start = time.time()
             doc = Document(doc_to_read)
             load_duration = time.time() - load_start
-            print(
-                f"[DOC-PROCESS] docx加载完成(耗时{load_duration:.2f}秒)，段落数: {len(doc.paragraphs)}"
-            )
+            log_info(f'[DOC-PROCESS] docx加载完成(耗时{load_duration:.2f}秒)，段落数: {len(doc.paragraphs)}')
 
         doc_open_duration = time.time() - doc_open_start
-        print(f"[DOC-PROCESS] 文档打开总耗时: {doc_open_duration:.2f}秒")
+        log_info(f'[DOC-PROCESS] 文档打开总耗时: {doc_open_duration:.2f}秒')
 
         try:
             sections = []
@@ -713,7 +749,7 @@ class DocumentProcessor:
             # 【优化】不再重新映射Heading层级，直接使用Heading的原始数字
             # 初始化所有可能的 Heading 1-9 映射，避免在大文档中全量扫描样式
             heading_styles_map = {i: i for i in range(1, 10)}
-            print(f"[HEADING-MAP] 应用默认Heading样式映射: {heading_styles_map}")
+            log_info(f'[HEADING-MAP] 应用默认Heading样式映射: {heading_styles_map}')
 
             def get_level_enhanced(text, style_name, p_obj):
                 if any(kw in text for kw in instruction_blacklist):
@@ -987,7 +1023,7 @@ class DocumentProcessor:
                     pass
 
             if uses_outline_level:
-                print("[INFO] 采样检测到文档使用 outline level")
+                log_info('[INFO] 采样检测到文档使用 outline level')
 
             # 将表格内的段落也收集起来
             for p in doc.paragraphs:
@@ -1005,7 +1041,7 @@ class DocumentProcessor:
                 collect_from_table(t)
 
             # --- 核心性能优化：预提取段落属性 ---
-            print(f"[DOC-PROCESS] 正在扫描 {len(all_paragraphs)} 个段落属性...")
+            log_info(f'[DOC-PROCESS] 正在扫描 {len(all_paragraphs)} 个段落属性...')
             para_attr_cache = []
             style_id_to_name = (
                 {}
@@ -1092,7 +1128,7 @@ class DocumentProcessor:
 
             # 第二轮：处理所有段落，应用TOC映射
             main_processing_start = time.time()
-            print(f"[DOC-PROCESS] 第二轮处理: 正在逐段落解析并应用TOC映射...")
+            log_info(f'[DOC-PROCESS] 第二轮处理: 正在逐段落解析并应用TOC映射...')
 
             in_procedure_section = False
             procedure_parent_level = 0
@@ -1165,9 +1201,7 @@ class DocumentProcessor:
                                 (toc_number, toc_level, has_number),
                             )
                             matched_toc_index = idx
-                            print(
-                                f"[TOC-MATCH-BY-NUMBER] 通过编号精确匹配: '{text}' → TOC '{toc_number}'"
-                            )
+                            log_info(f"[TOC-MATCH-BY-NUMBER] 通过编号精确匹配: '{text}' → TOC '{toc_number}'")
                             break
 
                 # 模式1: 精确匹配 - 在列表中按顺序查找第一个未使用的匹配项
@@ -1187,9 +1221,7 @@ class DocumentProcessor:
                                 (toc_number, toc_level, has_number),
                             )
                             matched_toc_index = idx
-                            print(
-                                f"[TOC-MATCH-EXACT] 精确标题匹配: '{text}' → TOC '{toc_number}'"
-                            )
+                            log_info(f"[TOC-MATCH-EXACT] 精确标题匹配: '{text}' → TOC '{toc_number}'")
                             break
 
                 if not matched_toc:
@@ -1217,9 +1249,7 @@ class DocumentProcessor:
                                     )
                                     if original_num == toc_number:
                                         # 原编号与TOC编号一致，直接使用原文本
-                                        print(
-                                            f"[TOC-MATCH-PREFIX-BY-NUM] 去除前缀后匹配且编号一致: '{text}' → TOC '{toc_number}'"
-                                        )
+                                        log_info(f"[TOC-MATCH-PREFIX-BY-NUM] 去除前缀后匹配且编号一致: '{text}' → TOC '{toc_number}'")
                                         matched_toc = (
                                             toc_title,
                                             (toc_number, toc_level, has_number),
@@ -1228,9 +1258,7 @@ class DocumentProcessor:
                                         break
                                     else:
                                         # 原编号与TOC编号不一致，打日志但继续
-                                        print(
-                                            f"[TOC-MISMATCH-NUM] 标题匹配但编号不同: 原'{original_num}' vs TOC'{toc_number}'"
-                                        )
+                                        log_info(f"[TOC-MISMATCH-NUM] 标题匹配但编号不同: 原'{original_num}' vs TOC'{toc_number}'")
                                         # 继续尝试其他TOC条目
                                         continue
                                 else:
@@ -1240,9 +1268,7 @@ class DocumentProcessor:
                                         (toc_number, toc_level, has_number),
                                     )
                                     matched_toc_index = idx
-                                    print(
-                                        f"[TOC-MATCH-PREFIX] 去除前缀后匹配: '{text}' → TOC '{toc_number}'"
-                                    )
+                                    log_info(f"[TOC-MATCH-PREFIX] 去除前缀后匹配: '{text}' → TOC '{toc_number}'")
                                     break
 
                     if not matched_toc and is_heading_style:
@@ -1267,9 +1293,7 @@ class DocumentProcessor:
                                     (toc_number, toc_level, has_number),
                                 )
                                 matched_toc_index = idx
-                                print(
-                                    f"[TOC-MATCH-PARTIAL] 部分匹配: '{text}' → TOC '{toc_title}'"
-                                )
+                                log_info(f"[TOC-MATCH-PARTIAL] 部分匹配: '{text}' → TOC '{toc_title}'")
                                 break
                             elif (
                                 len(text) >= 3
@@ -1282,9 +1306,7 @@ class DocumentProcessor:
                                     (toc_number, toc_level, has_number),
                                 )
                                 matched_toc_index = idx
-                                print(
-                                    f"[TOC-MATCH-PARTIAL-LOOSE] 宽松匹配: '{text}' → TOC '{toc_title}'"
-                                )
+                                log_info(f"[TOC-MATCH-PARTIAL-LOOSE] 宽松匹配: '{text}' → TOC '{toc_title}'")
                                 break
 
                 if matched_toc:
@@ -1316,27 +1338,23 @@ class DocumentProcessor:
                         in_procedure_section = True
                         procedure_parent_level = toc_level
                         list_item_counter = 0
-                        print(
-                            f"[PROCEDURE] 进入过程说明章节: {text_without_number}, Level={toc_level}"
-                        )
+                        log_info(f'[PROCEDURE] 进入过程说明章节: {text_without_number}, Level={toc_level}')
                     elif in_procedure_section and toc_level <= procedure_parent_level:
                         # 退出过程说明章节（遇到同级或更高级章节）
                         in_procedure_section = False
                         list_item_counter = 0
-                        print(f"[PROCEDURE] 退出过程说明章节")
+                        log_info(f'[PROCEDURE] 退出过程说明章节')
 
                     # 【处理无编号章节】如"版本历史"
                     if not has_number or toc_number is None:
-                        print(f"[TOC-MATCH] 正文标题匹配到无编号TOC: {text}")
+                        log_info(f'[TOC-MATCH] 正文标题匹配到无编号TOC: {text}')
                         level = toc_level
                         # 无编号章节，直接使用原标题，不添加编号
                         final_title = text
                         use_toc_number = False  # 标记为无编号，跳过后续的TOC编号处理
 
                         # 【保存无编号章节】
-                        print(
-                            f"[DEBUG-WORD-STRUCTURE] Level: {level} | FinalTitle: {final_title}"
-                        )
+                        log_info(f'[DEBUG-WORD-STRUCTURE] Level: {level} | FinalTitle: {final_title}')
 
                         # 保存前一个章节
                         if (
@@ -1347,9 +1365,7 @@ class DocumentProcessor:
                                 current_section["content"]
                             ).strip()
                             sections.append(current_section)
-                            print(
-                                f"[APPEND-SECTION #{len(sections)}] Level={current_section['level']}, Title={current_section['title'][:60]}"
-                            )
+                            log_info(f"[APPEND-SECTION #{len(sections)}] Level={current_section['level']}, Title={current_section['title'][:60]}")
 
                         # 更新路径跟踪
                         current_titles[level] = final_title
@@ -1374,15 +1390,13 @@ class DocumentProcessor:
                         # 跳过后续处理，继续下一个段落
                         continue
                     else:
-                        print(f"[TOC-MATCH] 正文标题匹配到TOC: {text} -> {toc_number}")
+                        log_info(f'[TOC-MATCH] 正文标题匹配到TOC: {text} -> {toc_number}')
 
                         # 【检测编号冲突】如果TOC编号已被其他章节使用，说明TOC有误
                         # 但对于无编号的TOC条目（如"附录A"），跳过冲突检测
                         use_toc_number = True
                         if toc_number and toc_number in used_numbers:
-                            print(
-                                f"[WARN] TOC编号冲突: [{toc_number}] 已被使用，改用自动编号"
-                            )
+                            log_warn(f'[WARN] TOC编号冲突: [{toc_number}] 已被使用，改用自动编号')
                             # 标记不使用TOC编号，但仍然保持是章节，使用TOC的level
                             use_toc_number = False
                             # 使用TOC的层级，但用自动编号
@@ -1390,7 +1404,7 @@ class DocumentProcessor:
 
                             # 【边界检查】
                             if level >= len(level_counters):
-                                print(f"[WARN] 层级 {level} 过深，跳过: {text[:40]}")
+                                log_warn(f'[WARN] 层级 {level} 过深，跳过: {text[:40]}')
                                 continue
 
                             # 增加当前层级计数器
@@ -1415,15 +1429,9 @@ class DocumentProcessor:
                             # 记录已使用的编号
                             used_numbers.add(auto_num)
 
-                            print(
-                                f"[AUTO-NUM-FALLBACK] TOC冲突，使用自动编号: {auto_num}, Level: {level}"
-                            )
-                            print(
-                                f"    → Generated: {auto_num}, Counters[1-6]: {level_counters[1:7]}"
-                            )
-                            print(
-                                f"[DEBUG-WORD-STRUCTURE] Level: {level} | FinalTitle: {final_title}"
-                            )
+                            log_info(f'[AUTO-NUM-FALLBACK] TOC冲突，使用自动编号: {auto_num}, Level: {level}')
+                            log_info(f'    → Generated: {auto_num}, Counters[1-6]: {level_counters[1:7]}')
+                            log_info(f'[DEBUG-WORD-STRUCTURE] Level: {level} | FinalTitle: {final_title}')
 
                             # 保存前一个章节
                             if (
@@ -1434,9 +1442,7 @@ class DocumentProcessor:
                                     current_section["content"]
                                 ).strip()
                                 sections.append(current_section)
-                                print(
-                                    f"[APPEND-SECTION #{len(sections)}] Level={current_section['level']}, Title={current_section['title'][:60]}"
-                                )
+                                log_info(f"[APPEND-SECTION #{len(sections)}] Level={current_section['level']}, Title={current_section['title'][:60]}")
 
                             # 更新路径跟踪
                             current_titles[level] = final_title
@@ -1474,9 +1480,7 @@ class DocumentProcessor:
                             chapter_key = (toc_number, clean_text)
 
                             if chapter_key in seen_chapters:
-                                print(
-                                    f"[WARN] 检测到重复章节(编号+标题完全相同)，跳过: [{toc_number}] {clean_text}"
-                                )
+                                log_warn(f'[WARN] 检测到重复章节(编号+标题完全相同)，跳过: [{toc_number}] {clean_text}')
                                 continue
 
                             # 记录这个章节
@@ -1528,12 +1532,8 @@ class DocumentProcessor:
                             for i in range(len(parts) + 1, len(level_counters)):
                                 level_counters[i] = 0
 
-                        print(
-                            f"    → Using TOC numbering, Updated Counters[1-6]: {level_counters[1:7]}"
-                        )
-                        print(
-                            f"[DEBUG-WORD-STRUCTURE] Level: {level} | FinalTitle: {final_title}"
-                        )
+                        log_info(f'    → Using TOC numbering, Updated Counters[1-6]: {level_counters[1:7]}')
+                        log_info(f'[DEBUG-WORD-STRUCTURE] Level: {level} | FinalTitle: {final_title}')
 
                         # 保存前一个章节
                         if (
@@ -1544,9 +1544,7 @@ class DocumentProcessor:
                                 current_section["content"]
                             ).strip()
                             sections.append(current_section)
-                            print(
-                                f"[APPEND-SECTION #{len(sections)}] Level={current_section['level']}, Title={current_section['title'][:60]}"
-                            )
+                            log_info(f"[APPEND-SECTION #{len(sections)}] Level={current_section['level']}, Title={current_section['title'][:60]}")
 
                         # 更新路径跟踪
                         current_titles[level] = final_title
@@ -1606,9 +1604,7 @@ class DocumentProcessor:
                                         (toc_number, toc_level, has_number),
                                     )
                                     level = toc_level
-                                    print(
-                                        f"[TOC-FUZZY-MATCH] 模糊匹配找到TOC: '{text_clean}' → '{toc_number}'"
-                                    )
+                                    log_info(f"[TOC-FUZZY-MATCH] 模糊匹配找到TOC: '{text_clean}' → '{toc_number}'")
                                     break
 
                 # 【列表项强制识别】
@@ -1625,9 +1621,7 @@ class DocumentProcessor:
                             level = procedure_parent_level + 1
                             # 标记为列表项，后续不再经过level_counters自动编号
                             is_list_item = True
-                            print(
-                                f"[LIST-ITEM] 强制识别列表项: {text[:40]} -> Level {level}, Item#{item_num}"
-                            )
+                            log_info(f'[LIST-ITEM] 强制识别列表项: {text[:40]} -> Level {level}, Item#{item_num}')
                         else:
                             is_list_item = False
                     else:
@@ -1745,15 +1739,13 @@ class DocumentProcessor:
                             in_procedure_section = True
                             procedure_parent_level = level
                             list_item_counter = 0
-                            print(
-                                f"[PROCEDURE] 进入过程说明章节(非TOC): {text_without_number}, Level={level}"
-                            )
+                            log_info(f'[PROCEDURE] 进入过程说明章节(非TOC): {text_without_number}, Level={level}')
 
                     # 检查是否退出过程说明章节（遇到正式章节）
                     elif in_procedure_section and level <= procedure_parent_level:
                         in_procedure_section = False
                         list_item_counter = 0
-                        print(f"[PROCEDURE] 退出过程说明章节（遇到同级或更高级章节）")
+                        log_info(f'[PROCEDURE] 退出过程说明章节（遇到同级或更高级章节）')
 
                     # 同步计数器与编号补全
                     clean_title = text
@@ -1799,9 +1791,7 @@ class DocumentProcessor:
                         # 【关键优化】如果有outline level，优先使用outline level
                         if has_outline_level_for_numbering and outline_level_value:
                             level = outline_level_value
-                            print(
-                                f"[OUTLINE-PRIORITY] 使用outline level覆盖手动编号检测: 文本编号={num_level} → outline_level={outline_level_value}"
-                            )
+                            log_info(f'[OUTLINE-PRIORITY] 使用outline level覆盖手动编号检测: 文本编号={num_level} → outline_level={outline_level_value}')
 
                         # 【重复检测】基于(编号,标题)完全匹配检测重复
                         is_duplicate = False
@@ -1815,9 +1805,7 @@ class DocumentProcessor:
 
                         chapter_key = (full_num_str, clean_content_temp)
                         if chapter_key in seen_chapters:
-                            print(
-                                f"[WARN] 检测到重复章节(编号+标题完全相同)，跳过: [{full_num_str}] {clean_content_temp[:40]}"
-                            )
+                            log_warn(f'[WARN] 检测到重复章节(编号+标题完全相同)，跳过: [{full_num_str}] {clean_content_temp[:40]}')
                             is_duplicate = True
 
                         if is_duplicate:
@@ -1842,9 +1830,7 @@ class DocumentProcessor:
                                     outline_level_value + 1, len(level_counters)
                                 ):
                                     level_counters[deeper] = 0
-                                print(
-                                    f"[OUTLINE-SYNC] 基于outline level同步计数器: level={outline_level_value}, counters[1-6]={level_counters[1:7]}"
-                                )
+                                log_info(f'[OUTLINE-SYNC] 基于outline level同步计数器: level={outline_level_value}, counters[1-6]={level_counters[1:7]}')
                             else:
                                 # 原有的手动编号同步逻辑
                                 # 强制同步计数器
@@ -1883,12 +1869,8 @@ class DocumentProcessor:
                             # 记录已使用的编号
                             used_numbers.add(full_num_str)
 
-                            print(
-                                f"[AUTO-NUM] Text: {text[:40]}, ManualNum: {full_num_str}, Level: {level}"
-                            )
-                            print(
-                                f"    → Using manual numbering, Updated Counters[1-6]: {level_counters[1:7]}"
-                            )
+                            log_info(f'[AUTO-NUM] Text: {text[:40]}, ManualNum: {full_num_str}, Level: {level}')
+                            log_info(f'    → Using manual numbering, Updated Counters[1-6]: {level_counters[1:7]}')
                         else:
                             # 如果手动编号判定为 None (已经在 get_level_enhanced 中拦截)
                             continue
@@ -1900,9 +1882,7 @@ class DocumentProcessor:
                         if is_list_item:
                             # 【边界检查】防止parent level过大
                             if procedure_parent_level >= len(level_counters):
-                                print(
-                                    f"[WARN] 列表项父层级 {procedure_parent_level} 过深，跳过: {text[:40]}"
-                                )
+                                log_warn(f'[WARN] 列表项父层级 {procedure_parent_level} 过深，跳过: {text[:40]}')
                                 continue
 
                             # 列表项：使用父章节编号 + 列表项序号
@@ -1914,12 +1894,8 @@ class DocumentProcessor:
                             parent_num = ".".join(map(str, parent_parts))
                             auto_num = f"{parent_num}.{list_item_counter}"
 
-                            print(
-                                f"[AUTO-NUM-LIST] ListItem: {text[:40]}, Parent Level: {procedure_parent_level}, Item#: {list_item_counter}"
-                            )
-                            print(
-                                f"    → Generated: {auto_num}, Counters[1-6]: {level_counters[1:7]}"
-                            )
+                            log_info(f'[AUTO-NUM-LIST] ListItem: {text[:40]}, Parent Level: {procedure_parent_level}, Item#: {list_item_counter}')
+                            log_info(f'    → Generated: {auto_num}, Counters[1-6]: {level_counters[1:7]}')
 
                             # 提取列表项文本（去掉"1. "前缀）
                             list_item_match = re.match(r"^\d+[.．]\s+(.+)$", text)
@@ -1962,15 +1938,11 @@ class DocumentProcessor:
                                     ):
                                         level_counters[i] = 0
 
-                                    print(
-                                        f"[DEEP-OUTLINE] 从文本推导深层编号: {inferred_num}, level={outline_level_value}"
-                                    )
+                                    log_info(f'[DEEP-OUTLINE] 从文本推导深层编号: {inferred_num}, level={outline_level_value}')
                                 else:
                                     # 从文本中找不到编号，但有outline level
                                     # 这种情况较少见，记录警告
-                                    print(
-                                        f"[WARN] 深层项目但未找到编号: '{text[:40]}', outline_level={outline_level_value}"
-                                    )
+                                    log_warn(f"[WARN] 深层项目但未找到编号: '{text[:40]}', outline_level={outline_level_value}")
                                     # 不使用自动编号，而是保留原文
                                     clean_title = text
                                     current_section = {
@@ -1990,9 +1962,7 @@ class DocumentProcessor:
 
                             # 【边界检查】
                             if level >= len(level_counters):
-                                print(
-                                    f"[WARN] 层级 {level} 过深(超过{len(level_counters)}层)，跳过: {text[:40]}"
-                                )
+                                log_warn(f'[WARN] 层级 {level} 过深(超过{len(level_counters)}层)，跳过: {text[:40]}')
                                 continue
 
                             # 增加当前层级计数器
@@ -2015,10 +1985,7 @@ class DocumentProcessor:
                             # 【关键检查】检查生成的编号是否已被使用
                             # 如果已被使用，说明计数器逻辑有问题，需要调整
                             if auto_num in used_numbers:
-                                print(
-                                    f"[WARN] 自动生成的编号 '{auto_num}' 已被使用！可能是计数器逻辑错误"
-                                )
-                                # 尝试找到下一个可用的编号
+                                log_warn(f"[WARN] 自动生成的编号 '{auto_num}' 已被使用！可能是计数器逻辑错误")                                # 尝试找到下一个可用的编号
                                 counter = 1
                                 while (
                                     f"{auto_num.rsplit('.', 1)[0]}.{counter}"
@@ -2028,12 +1995,10 @@ class DocumentProcessor:
                                     counter += 1
                                 if counter < 100:
                                     auto_num = f"{auto_num.rsplit('.', 1)[0]}.{counter}"
-                                    print(f"    → 调整为: {auto_num}")
+                                    log_info(f'    → 调整为: {auto_num}')
 
-                            print(f"[AUTO-NUM] Text: {text[:40]}, Level: {level}")
-                            print(
-                                f"    → Generated: {auto_num}, Counters[1-6]: {level_counters[1:7]}"
-                            )
+                            log_info(f'[AUTO-NUM] Text: {text[:40]}, Level: {level}')
+                            log_info(f'    → Generated: {auto_num}, Counters[1-6]: {level_counters[1:7]}')
 
                             # 清理标题文本（去除开头的数字编号，避免重复）
                             clean_content_temp = re.sub(
@@ -2051,9 +2016,7 @@ class DocumentProcessor:
 
                     # 【控制台调试输出】打印实际获取到的 Word 目录项及其层级
                     if sections_found < 20:  # 只打印前20个章节的详情
-                        print(
-                            f"[DEBUG-WORD-STRUCTURE] Level: {level} | FinalTitle: {clean_title}"
-                        )
+                        log_info(f'[DEBUG-WORD-STRUCTURE] Level: {level} | FinalTitle: {clean_title}')
 
                     sections_found += 1
 
@@ -2066,9 +2029,7 @@ class DocumentProcessor:
                             current_section["content"]
                         ).strip()
                         sections.append(current_section)
-                        print(
-                            f"[APPEND-SECTION #{len(sections)}] Level={current_section['level']}, Title={current_section['title'][:60]}"
-                        )
+                        log_info(f"[APPEND-SECTION #{len(sections)}] Level={current_section['level']}, Title={current_section['title'][:60]}")
 
                     # 更新路径跟踪
                     current_titles[level] = clean_title
@@ -2112,16 +2073,16 @@ class DocumentProcessor:
             final_processing_end = time.time()
             total_processing_time = final_processing_end - main_processing_start
             overall_time = final_processing_end - start_time
-            print(f"[DOC-PROCESS] ✓ 第二轮处理完成")
-            print(
-                f"[DOC-PROCESS] 统计: 总章节={len(sections)}, 添加内容行={content_lines_added}, 第二轮耗时={total_processing_time:.2f}秒, 总耗时={overall_time:.2f}秒"
-            )
+            log_info(f'[DOC-PROCESS] ✓ 第二轮处理完成')
+            # print(
+            #     f"[DOC-PROCESS] 统计: 总章节={len(sections)}, 添加内容行={content_lines_added}, 第二轮耗时={total_processing_time:.2f}秒, 总耗时={overall_time:.2f}秒"
+            # )
 
             return sections
         except Exception as e:
             import traceback
 
-            print(f"提取 Word 结构失败: {e}")
+            log_error(f'提取 Word 结构失败: {e}')
             traceback.print_exc()
             return []
         finally:
@@ -2184,7 +2145,7 @@ class DocumentProcessor:
                     "full_path": "",
                 }
             )
-            print(f"[FILL-GAP] 补充缺失层级: {number}. (层级占位)")
+            log_info(f'[FILL-GAP] 补充缺失层级: {number}. (层级占位)')
 
         # 第四步：按编号排序
         def sort_key(s):
@@ -2347,7 +2308,7 @@ class DocumentProcessor:
                 RuntimeLogger.log(f"获取功能点数失败: {e}", level="ERROR")
             except:
                 pass
-            print(f"获取功能点数失败: {e}")
+            log_error(f'获取功能点数失败: {e}')
             return 0
 
     @staticmethod
@@ -2484,6 +2445,19 @@ class DocumentProcessor:
                     f"   [Node 4] 章节定位: 规模因子段={scale_info.get('title') if scale_info else '未找到'}, 质量因子段={quality_info.get('title') if quality_info else '未找到'}"
                 )
 
+                # [性能修复] 目录标题只规范化一次，建哈希表做精确匹配。
+                # 原实现对"每个短段落 × 每个目录节点"都重复执行 re.sub，
+                # O(N×M) 在大文档上是数百万次正则调用，仅此一步就耗时 3 分钟以上。
+                section_lookup = {}
+                for s in target_sections:
+                    s_title = (s.get("title") or "").strip()
+                    tmp_s = s_title.lstrip(". \t\n\r")
+                    core_s = re.sub(
+                        r"^[^\w\u4e00-\u9fa5]*\d+[\.\d\s、-]*", "", tmp_s
+                    ).strip()
+                    if core_s and core_s not in section_lookup:
+                        section_lookup[core_s] = s
+
                 # 利用 doc.element.body.iterchildren() 确保正文和表格在收集时保持原始顺序
                 for child in doc.element.body.iterchildren():
                     is_p = child.tag.endswith("p")
@@ -2502,19 +2476,7 @@ class DocumentProcessor:
                             matched_s = None
 
                             if clean_txt and len(clean_txt) < 50:
-                                for s in target_sections:
-                                    s_title = (s.get("title") or "").strip()
-                                    tmp_s = s_title.lstrip(". \t\n\r")
-                                    core_s = re.sub(
-                                        r"^[^\w\u4e00-\u9fa5]*\d+[\.\d\s、-]*",
-                                        "",
-                                        tmp_s,
-                                    ).strip()
-
-                                    # [FIX] 更加严格的匹配：仅匹配完全相等的标题
-                                    if core_s and clean_txt == core_s:
-                                        matched_s = s
-                                        break
+                                matched_s = section_lookup.get(clean_txt)
 
                             if matched_s:
                                 last_cat = active_category
@@ -2567,12 +2529,12 @@ class DocumentProcessor:
                     # 收集数据块：此处不受 200 字符限制，只要在 active_category 范围内即收集
                     if active_category == "scale":
                         if is_p:
-                            scale_paras.append(Paragraph(child, doc))
+                            scale_paras.append(p_obj)
                         elif is_tbl:
                             scale_tables.append(Table(child, doc))
                     elif active_category == "quality":
                         if is_p:
-                            quality_paras.append(Paragraph(child, doc))
+                            quality_paras.append(p_obj)
                         elif is_tbl:
                             quality_tables.append(Table(child, doc))
 
@@ -2964,7 +2926,7 @@ class DocumentProcessor:
 
             return factors
         except Exception as e:
-            print(f"提取调整因子失败: {e}")
+            log_error(f'提取调整因子失败: {e}')
             return {}
         finally:
             if temp_docx and os.path.exists(temp_docx):
@@ -2973,247 +2935,32 @@ class DocumentProcessor:
                 except:
                     pass
 
-    # @staticmethod
-    # def check_excel_empty_cells(file_path, sheet_name=None):
-    #     """
-    #     检查 Excel 的空值情况 (精准合并单元格判定版 V3)
-    #     """
-    #     try:
-    #         import openpyxl
-    #
-    #         wb = openpyxl.load_workbook(file_path, data_only=True)
-    #         target_sheet_name = sheet_name
-    #         if not target_sheet_name:
-    #             for name in wb.sheetnames:
-    #                 if "功能点拆分" in name:
-    #                     target_sheet_name = name
-    #                     break
-    #
-    #         if not target_sheet_name or target_sheet_name not in wb.sheetnames:
-    #             if not sheet_name and wb.sheetnames:
-    #                 target_sheet_name = wb.sheetnames[0]
-    #             else:
-    #                 return {
-    #                     "is_ok": False,
-    #                     "errors": ["未找到有效的工作表进行空值校验"],
-    #                 }
-    #
-    #         ws = wb[target_sheet_name]
-    #
-    #         # 1. 探测表头区域 (多行探测)
-    #         header_start = -1
-    #         header_end = -1
-    #         # 探测前 30 行，寻找核心关键字
-    #         for row_idx in range(1, 31):
-    #             row_vals = [
-    #                 str(ws.cell(row=row_idx, column=col).value) for col in range(1, 20)
-    #             ]
-    #             row_str = " ".join([v for v in row_vals if v != "None"])
-    #             if "客户需求" in row_str or "一级模块" in row_str:
-    #                 if header_start == -1:
-    #                     header_start = row_idx
-    #                 header_end = row_idx
-    #
-    #         if header_start == -1:
-    #             return {
-    #                 "is_ok": False,
-    #                 "errors": ["未能在工作表中定位到“客户需求”或“一级模块”表头行"],
-    #             }
-    #
-    #         # 2. 定位关键校验列
-    #         target_keywords = [
-    #             "客户需求",
-    #             "一级模块",
-    #             "二级模块",
-    #             "三级模块",
-    #             "功能用户",
-    #             "触发事件",
-    #             "功能过程",
-    #             "子过程描述",
-    #             "数据移动类型",
-    #             "数据组",
-    #             "数据属性",
-    #             "复用度",
-    #             "CFP",
-    #         ]
-    #
-    #         col_map = {}  # {keyword: col_index_1_based}
-    #         for col_idx in range(1, ws.max_column + 1):
-    #             # 检查 header_end 这一行，或其上方的表头行
-    #             cell_val = ""
-    #             for h_idx in range(header_start, header_end + 1):
-    #                 val = ws.cell(row=h_idx, column=col_idx).value
-    #                 if val:
-    #                     cell_val += str(val)
-    #
-    #             for kw in target_keywords:
-    #                 if kw in cell_val:
-    #                     col_map[kw] = col_idx
-    #                     break
-    #
-    #         if not col_map:
-    #             return {
-    #                 "is_ok": False,
-    #                 "errors": ["未匹配到任何待校验的关键列，请检查表头名称"],
-    #             }
-    #
-    #         # 3. 确定有效数据范围
-    #         last_valid_row = header_end
-    #         for r in range(header_end + 1, ws.max_row + 1):
-    #             # 检查是否触底 (图3中的注记文字)
-    #             first_cell_val = str(ws.cell(row=r, column=1).value or "").strip()
-    #             if (
-    #                 first_cell_val.startswith("注：")
-    #                 or "请在正式提交时删除" in first_cell_val
-    #             ):
-    #                 break
-    #
-    #             # 检查整行是否有数据
-    #             row_has_something = False
-    #             for c in range(1, 21):  # 检测前20列
-    #                 if ws.cell(row=r, column=c).value is not None:
-    #                     row_has_something = True
-    #                     break
-    #
-    #             if row_has_something:
-    #                 last_valid_row = r
-    #
-    #         if last_valid_row <= header_end:
-    #             # 可能是个空表，除了表头没数据
-    #             return {"is_ok": True, "errors": []}
-    #
-    #         # 4. 建立合并单元格查询表 (row, col) -> (top_left_value)
-    #         merged_lookup = {}
-    #         for merged_range in ws.merged_cells.ranges:
-    #             min_col, min_row, max_col, max_row = merged_range.bounds
-    #             tl_val = ws.cell(row=min_row, column=min_col).value
-    #             for r in range(min_row, max_row + 1):
-    #                 for c in range(min_col, max_col + 1):
-    #                     merged_lookup[(r, c)] = tl_val
-    #
-    #         # 5. 遍历扫描 (核心：不再跳过整天空行)
-    #         col_errors = {kw: [] for kw in col_map.keys()}
-    #
-    #         for r_idx in range(header_end + 1, last_valid_row + 1):
-    #             for kw, c_idx in col_map.items():
-    #                 val = ws.cell(row=r_idx, column=c_idx).value
-    #
-    #                 # 确定最终判定值
-    #                 actual_val = val
-    #                 if (
-    #                     val is None
-    #                     or str(val).strip() == ""
-    #                     or str(val).lower() == "nan"
-    #                 ):
-    #                     if (r_idx, c_idx) in merged_lookup:
-    #                         actual_val = merged_lookup[(r_idx, c_idx)]
-    #
-    #                 if (
-    #                     actual_val is None
-    #                     or str(actual_val).strip() == ""
-    #                     or str(actual_val).lower() == "nan"
-    #                 ):
-    #                     col_errors[kw].append(r_idx)
-    #
-    #         # 6. 格式化错误信息 (合并连续行)
-    #         final_errors = []
-    #         for kw in target_keywords:  # 按预定义顺序排列
-    #             if kw not in col_errors:
-    #                 continue
-    #             rows = sorted(list(set(col_errors[kw])))
-    #             if not rows:
-    #                 continue
-    #
-    #             ranges = []
-    #             start = rows[0]
-    #             prev = start
-    #             for curr in rows[1:]:
-    #                 if curr == prev + 1:
-    #                     prev = curr
-    #                 else:
-    #                     ranges.append(
-    #                         f"{start}-{prev}" if start != prev else f"{start}"
-    #                     )
-    #                     start = curr
-    #                     prev = curr
-    #             ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
-    #             final_errors.append(f"拆分表中第{', '.join(ranges)}行{kw}为空")
-    #
-    #         # 7. 生成报告文件 (包含时间戳)
-    #         report_path = None
-    #         if True:  # 总是生成报告供查询
-    #             try:
-    #                 import pandas as pd
-    #                 from datetime import datetime
-    #
-    #                 # 获取项目名称 (不含路径和扩展名)
-    #                 base_name = os.path.splitext(os.path.basename(file_path))[0]
-    #
-    #                 # 生成时间戳
-    #                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    #
-    #                 # 报告文件名: 项目名_时间戳_Excel空值检查报告.xlsx
-    #                 report_filename = f"{base_name}_{timestamp}_Excel空值检查报告.xlsx"
-    #
-    #                 # 使用配置中的存放位置
-    #                 from extend.matcher_config import MatcherConfig
-    #
-    #                 config = MatcherConfig.load()
-    #                 output_dir = config.get("storage", {}).get("initial_review")
-    #                 if output_dir:
-    #                     output_dir = os.path.abspath(output_dir)
-    #                     if not os.path.exists(output_dir):
-    #                         os.makedirs(output_dir, exist_ok=True)
-    #                 else:
-    #                     output_dir = "."
-    #
-    #                 report_path = os.path.join(output_dir, report_filename)
-    #
-    #                 # 生成报告数据
-    #                 report_data = []
-    #                 if final_errors:
-    #                     for error_msg in final_errors:
-    #                         report_data.append({"检查项": error_msg})
-    #                 else:
-    #                     report_data.append({"检查项": "✅ 所有关键列空值检查通过"})
-    #
-    #                 # 写入Excel
-    #                 df_report = pd.DataFrame(report_data)
-    #                 with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
-    #                     df_report.to_excel(
-    #                         writer, index=False, sheet_name="空值检查结果"
-    #                     )
-    #
-    #             except Exception as e:
-    #                 # 报告生成失败不影响主流程
-    #                 try:
-    #                     from utils.runtime_logger import RuntimeLogger
-    #
-    #                     RuntimeLogger.log(
-    #                         f"生成Excel空值检查报告失败: {e}", level="WARN"
-    #                     )
-    #                 except:
-    #                     pass
-    #
-    #         return {
-    #             "is_ok": len(final_errors) == 0,
-    #             "errors": final_errors,
-    #             "report_path": report_path,
-    #         }
-    #     except Exception as e:
-    #         return {
-    #             "is_ok": False,
-    #             "errors": [f"Excel 校验引擎异常 (V3): {str(e)}"],
-    #             "report_path": None,
-    #         }
     @staticmethod
-    def check_excel_empty_cells(file_path, sheet_name=None):
+    def check_excel_empty_cells(file_path, sheet_name=None, report_base_name=None, project_name=None):
+
         """
         检查 Excel 的空值情况 (精准合并单元格判定版 V3)
+
+        Args:
+            file_path: Excel 文件路径
+            sheet_name: 工作表名称（可选，默认自动寻找包含"功能点拆分"的表）
+            report_base_name: 统一的报告基础名称（用于提取时间戳）
+
+        Returns:
+            dict: {
+                'is_ok': bool,
+                'errors': list[str],
+                'report_path': str
+            }
         """
         try:
             import openpyxl
+            import pandas as pd
+            from utils.initial_review_report import report_file_path
+
             wb = openpyxl.load_workbook(file_path, data_only=True)
+
+            # 1. 自动定位工作表
             target_sheet_name = sheet_name
             if not target_sheet_name:
                 for name in wb.sheetnames:
@@ -3227,123 +2974,108 @@ class DocumentProcessor:
                     return {
                         "is_ok": False,
                         "errors": ["未找到有效的工作表进行空值校验"],
+                        "report_path": None
                     }
+
             ws = wb[target_sheet_name]
-            # 1. 探测表头区域 (多行探测)
+
+            # 2. 探测表头区域 (多行探测)
             header_start = -1
             header_end = -1
             for row_idx in range(1, 31):
-                row_vals = [
-                    str(ws.cell(row=row_idx, column=col).value) for col in range(1, 20)
-                ]
+                row_vals = [str(ws.cell(row=row_idx, column=col).value) for col in range(1, 20)]
                 row_str = " ".join([v for v in row_vals if v != "None"])
                 if "客户需求" in row_str or "一级模块" in row_str:
-                    if header_start == -1:
-                        header_start = row_idx
+                    if header_start == -1: header_start = row_idx
                     header_end = row_idx
             if header_start == -1:
-                return {
-                    "is_ok": False,
-                    "errors": ["未能在工作表中定位到“客户需求”或“一级模块”表头行"],
-                }
-            # 2. 定位关键校验列
+                return {"is_ok": False, "errors": ["未能在工作表中定位到“客户需求”或“一级模块”表头行"],
+                        "report_path": None}
+
+            # 3. 定位关键校验列
             target_keywords = [
                 "客户需求", "一级模块", "二级模块", "三级模块", "功能用户",
                 "触发事件", "功能过程", "子过程描述", "数据移动类型",
-                "数据组", "数据属性", "复用度", "CFP",
+                "数据组", "数据属性", "复用度", "CFP"
             ]
             col_map = {}
             for col_idx in range(1, ws.max_column + 1):
                 cell_val = ""
                 for h_idx in range(header_start, header_end + 1):
                     val = ws.cell(row=h_idx, column=col_idx).value
-                    if val:
-                        cell_val += str(val)
+                    if val: cell_val += str(val)
                 for kw in target_keywords:
                     if kw in cell_val:
                         col_map[kw] = col_idx
                         break
             if not col_map:
-                return {
-                    "is_ok": False,
-                    "errors": ["未匹配到任何待校验的关键列，请检查表头名称"],
-                }
-            # 3. 确定有效数据范围
+                return {"is_ok": False, "errors": ["未匹配到任何待校验的关键列，请检查表头名称"], "report_path": None}
+
+            # 4. 确定有效数据范围
             last_valid_row = header_end
             for r in range(header_end + 1, ws.max_row + 1):
                 first_cell_val = str(ws.cell(row=r, column=1).value or "").strip()
-                if first_cell_val.startswith("注：") or "请在正式提交时删除" in first_cell_val:
-                    break
+                if first_cell_val.startswith("注：") or "请在正式提交时删除" in first_cell_val: break
                 row_has_something = False
                 for c in range(1, 21):
-                    if ws.cell(row=r, column=c).value is not None:
-                        row_has_something = True
-                        break
-                if row_has_something:
-                    last_valid_row = r
-            if last_valid_row <= header_end:
-                return {"is_ok": True, "errors": []}
-            # 4. 建立合并单元格查询表
+                    if ws.cell(row=r, column=c).value is not None: row_has_something = True; break
+                if row_has_something: last_valid_row = r
+            if last_valid_row <= header_end: return {"is_ok": True, "errors": [], "report_path": None}
+
+            # 5. 建立合并单元格查询表
             merged_lookup = {}
             for merged_range in ws.merged_cells.ranges:
                 min_col, min_row, max_col, max_row = merged_range.bounds
                 tl_val = ws.cell(row=min_row, column=min_col).value
                 for r in range(min_row, max_row + 1):
-                    for c in range(min_col, max_col + 1):
-                        merged_lookup[(r, c)] = tl_val
-            # 5. 遍历扫描
+                    for c in range(min_col, max_col + 1): merged_lookup[(r, c)] = tl_val
+
+            # 6. 遍历扫描空值
             col_errors = {kw: [] for kw in col_map.keys()}
             for r_idx in range(header_end + 1, last_valid_row + 1):
                 for kw, c_idx in col_map.items():
                     val = ws.cell(row=r_idx, column=c_idx).value
                     actual_val = val
                     if val is None or str(val).strip() == "" or str(val).lower() == "nan":
-                        if (r_idx, c_idx) in merged_lookup:
-                            actual_val = merged_lookup[(r_idx, c_idx)]
+                        if (r_idx, c_idx) in merged_lookup: actual_val = merged_lookup[(r_idx, c_idx)]
                     if actual_val is None or str(actual_val).strip() == "" or str(actual_val).lower() == "nan":
                         col_errors[kw].append(r_idx)
-            # 6. 格式化错误信息
+
+            # 7. 格式化错误信息
             final_errors = []
             for kw in target_keywords:
-                if kw not in col_errors:
-                    continue
+                if kw not in col_errors: continue
                 rows = sorted(list(set(col_errors[kw])))
-                if not rows:
-                    continue
+                if not rows: continue
                 ranges = []
-                start = rows[0]
+                start = rows[0];
                 prev = start
                 for curr in rows[1:]:
                     if curr == prev + 1:
                         prev = curr
                     else:
                         ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
-                        start = curr
+                        start = curr;
                         prev = curr
                 ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
                 final_errors.append(f"拆分表中第{', '.join(ranges)}行{kw}为空")
 
-            # 7. 生成报告文件 (包含时间戳)
+            # 8. 【核心修复】使用初评报告统一路径模块，确保进入本次运行的时间戳文件夹
             report_path = None
             try:
-                import pandas as pd
-                from datetime import datetime
-                base_name = os.path.splitext(os.path.basename(file_path))[0]
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                report_filename = f"{base_name}_{timestamp}_Excel空值检查报告.xlsx"
-
-                # ================= 【修改】使用项目专属目录自动归档 =================
-                from utils.path_utils import get_project_report_dir
-                output_dir = get_project_report_dir()
-                report_path = os.path.join(output_dir, report_filename)
-                # ====================================================================
+                # 【修改】：优先使用透传下来的 project_name (即 display_name)，如果没有则回退到 file_path
+                _, report_path = report_file_path(
+                    report_type="Excel空值检查报告",
+                    project_name_or_path=file_path,
+                    report_base_name=report_base_name,
+                )
 
                 report_data = []
                 if final_errors:
-                    for error_msg in final_errors:
-                        report_data.append({"检查项": error_msg})
+                    for error_msg in final_errors: report_data.append({"检查项": error_msg})
                 else:
                     report_data.append({"检查项": "✅ 所有关键列空值检查通过"})
+
                 df_report = pd.DataFrame(report_data)
                 with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
                     df_report.to_excel(writer, index=False, sheet_name="空值检查结果")
@@ -3353,17 +3085,11 @@ class DocumentProcessor:
                     RuntimeLogger.log(f"生成Excel空值检查报告失败: {e}", level="WARN")
                 except:
                     pass
-            return {
-                "is_ok": len(final_errors) == 0,
-                "errors": final_errors,
-                "report_path": report_path,
-            }
+
+            return {"is_ok": len(final_errors) == 0, "errors": final_errors, "report_path": report_path}
+
         except Exception as e:
-            return {
-                "is_ok": False,
-                "errors": [f"Excel 校验引擎异常 (V3): {str(e)}"],
-                "report_path": None,
-            }
+            return {"is_ok": False, "errors": [f"Excel 校验引擎异常 (V3): {str(e)}"], "report_path": None}
 
     @staticmethod
     def extract_excel_info(file_path):
@@ -3378,7 +3104,7 @@ class DocumentProcessor:
                 info[sheet_name] = df.columns.tolist()
             return info
         except Exception as e:
-            print(f"提取 Excel 信息失败: {e}")
+            log_error(f'提取 Excel 信息失败: {e}')
             return {}
 
     @staticmethod
@@ -3438,171 +3164,18 @@ class DocumentProcessor:
         except:
             return []
 
-    # @staticmethod
-    # def validate_hierarchy_matching(
-    #     word_path,
-    #     excel_path,
-    #     header_row=0,
-    #     level1_col=None,
-    #     level2_col=None,
-    #     level3_col=None,
-    #     sheet_name=None,
-    #     fuzzy_match=True,
-    #     threshold=0.8,
-    #     progress_callback=None,
-    #     word_sections_preloaded=None,
-    #     project_name=None,
-    # ):
-    #     """
-    #     节点5：层级匹配校验
-    #     使用 HierarchicalMatcher 进行 Excel 一二三级模块与 Word 标题的层级对应校验
-    #     """
-    #     try:
-    #         import pandas as pd
-    #         import os
-    #
-    #         matcher = HierarchicalMatcher(fuzzy_match=fuzzy_match, threshold=threshold)
-    #
-    #         # [FIX] 优先使用预加载的层级数据
-    #         # 层级匹配（Step 5）只需要标题结构，即使 content 为空也不应强制重新提取（会导致自动编号逻辑介入）
-    #         if word_sections_preloaded is None:
-    #             # 如果没有预加载，且提供了路径，使用稳定模式提取
-    #             if isinstance(word_path, str) and word_path:
-    #                 word_sections_preloaded = DocumentProcessor.extract_word_structure(
-    #                     word_path, use_stable=True
-    #                 )
-    #             elif hasattr(word_path, "paragraphs"):
-    #                 word_sections_preloaded = DocumentProcessor.extract_word_structure(
-    #                     word_path
-    #                 )
-    #
-    #         # 加载配置
-    #         config = MatcherConfig.load()
-    #         h_config = config.get(
-    #             "hierarchy", MatcherConfig.get_defaults()["hierarchy"]
-    #         )
-    #
-    #         # 使用配置中的列索引 (如果参数未提供，则使用配置值)
-    #         l1_c = (
-    #             level1_col if level1_col is not None else h_config.get("level1_col", 1)
-    #         )
-    #         l2_c = (
-    #             level2_col if level2_col is not None else h_config.get("level2_col", 2)
-    #         )
-    #         l3_c = (
-    #             level3_col if level3_col is not None else h_config.get("level3_col", 3)
-    #         )
-    #
-    #         # 确定要使用的工作表
-    #         target_sheet_name = sheet_name
-    #         if target_sheet_name is None:
-    #             sheet_idx = h_config.get(
-    #                 "sheet_name", 2
-    #             )  # Default to 3rd sheet (index 2)
-    #             try:
-    #                 xl = pd.ExcelFile(excel_path)
-    #                 sheet_names = xl.sheet_names
-    #                 if len(sheet_names) > sheet_idx:
-    #                     target_sheet_name = sheet_names[sheet_idx]
-    #                 elif len(sheet_names) > 0:
-    #                     target_sheet_name = sheet_names[0]
-    #             except Exception as e:
-    #                 print(f"Error checking sheets: {e}")
-    #                 target_sheet_name = 0
-    #
-    #         print(
-    #             f"[DEBUG] validate_hierarchy_matching: sheet={target_sheet_name}, l1={l1_c}, l2={l2_c}, l3={l3_c}, header={header_row}"
-    #         )
-    #
-    #         # 准备 Word 结构树日志路径
-    #         # 使用项目名
-    #         if project_name:
-    #             clean_name = ReportGenerator._clean_project_name(project_name)
-    #         elif word_sections_preloaded is not None:
-    #             clean_name = "项目报告"
-    #         else:
-    #             clean_name = ReportGenerator._clean_project_name(word_path)
-    #
-    #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    #         base_name = f"{clean_name}_{timestamp}"
-    #
-    #         config = MatcherConfig.load()
-    #         output_dir = config.get("storage", {}).get("initial_review")
-    #         if output_dir:
-    #             output_dir = os.path.abspath(output_dir)
-    #             if not os.path.exists(output_dir):
-    #                 os.makedirs(output_dir, exist_ok=True)
-    #             tree_log_path = os.path.join(output_dir, f"{base_name}-Word结构树.txt")
-    #         else:
-    #             tree_log_path = os.path.join(os.getcwd(), f"{base_name}-Word结构树.txt")
-    #
-    #         report = matcher.match_hierarchical_documents(
-    #             word_path,
-    #             excel_path,
-    #             sheet_name=target_sheet_name,
-    #             level1_col=l1_c,
-    #             level2_col=l2_c,
-    #             level3_col=l3_c,
-    #             header=header_row,
-    #             progress_callback=progress_callback,
-    #             hierarchy_log_path=tree_log_path,
-    #             word_sections_preloaded=word_sections_preloaded,  # [FIX] 传递预加载数据，避免重复提取和错误处理
-    #         )
-    #
-    #         # 保存报告
-    #         report_filename = f"{base_name}-层级匹配报告.xlsx"
-    #
-    #         # 使用配置中的存放位置
-    #         output_dir = config.get("storage", {}).get("initial_review")
-    #         if output_dir:
-    #             output_dir = os.path.abspath(output_dir)
-    #             if not os.path.exists(output_dir):
-    #                 os.makedirs(output_dir, exist_ok=True)
-    #             report_path = os.path.join(output_dir, report_filename)
-    #         else:
-    #             report_path = os.path.abspath(report_filename)
-    #
-    #         saved_path = matcher.save_report(report, report_path)
-    #         report["report_path"] = os.path.abspath(saved_path)
-    #
-    #         # [NEW] 同时保存JSON报告到单独的子文件夹
-    #         json_report_dir = os.path.join(
-    #             output_dir if output_dir else os.path.dirname(report_path),
-    #             "json_reports",
-    #         )
-    #         if not os.path.exists(json_report_dir):
-    #             os.makedirs(json_report_dir, exist_ok=True)
-    #
-    #         json_report_filename = f"{base_name}-hierarchy_matching.json"
-    #         json_report_path = os.path.join(json_report_dir, json_report_filename)
-    #         try:
-    #             import json
-    #
-    #             with open(json_report_path, "w", encoding="utf-8") as f:
-    #                 json.dump(report, f, ensure_ascii=False, indent=2)
-    #             report["json_report_path"] = json_report_path
-    #             if RuntimeLogger:
-    #                 RuntimeLogger.log(
-    #                     f"✓ JSON报告已保存: {json_report_path}", level="INFO"
-    #                 )
-    #         except Exception as e:
-    #             print(f"警告: 无法保存JSON报告: {e}")
-    #
-    #         return report
-    #     except Exception as e:
-    #         print(f"层级匹配校验失败: {e}")
-    #         return {"is_valid": False, "error": str(e)}
-
     @staticmethod
     def validate_hierarchy_matching(
             word_path, excel_path, header_row=0, level1_col=None, level2_col=None,
             level3_col=None, sheet_name=None, fuzzy_match=True, threshold=0.8,
             progress_callback=None, word_sections_preloaded=None, project_name=None,
+            report_base_name=None,
     ):
-        """节点5：层级匹配校验"""
         try:
             import pandas as pd
             import os
+            from utils.initial_review_report import run_output_dir
+
             matcher = HierarchicalMatcher(fuzzy_match=fuzzy_match, threshold=threshold)
             if word_sections_preloaded is None:
                 if isinstance(word_path, str) and word_path:
@@ -3627,7 +3200,7 @@ class DocumentProcessor:
                     elif len(sheet_names) > 0:
                         target_sheet_name = sheet_names[0]
                 except Exception as e:
-                    print(f"Error checking sheets: {e}")
+                    log_error(f'Error checking sheets: {e}')
                     target_sheet_name = 0
 
             if project_name:
@@ -3636,14 +3209,15 @@ class DocumentProcessor:
                 clean_name = "项目报告"
             else:
                 clean_name = ReportGenerator._clean_project_name(word_path)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_name = f"{clean_name}_{timestamp}"
 
-            # ================= 【修改】使用项目专属目录自动归档 =================
-            from utils.path_utils import get_project_report_dir
-            output_dir = get_project_report_dir()
-            tree_log_path = os.path.join(output_dir, f"{base_name}-Word结构树.txt")
-            # ====================================================================
+            # 【核心修复】：统一路径模块生成本次运行的时间戳文件夹
+            output_dir = run_output_dir(
+                project_name or word_path,
+                report_base_name,
+            )
+
+            # 文件名统一带上项目名
+            tree_log_path = os.path.join(output_dir, f"{clean_name}_Word结构树.txt")
 
             report = matcher.match_hierarchical_documents(
                 word_path, excel_path, sheet_name=target_sheet_name,
@@ -3652,29 +3226,25 @@ class DocumentProcessor:
                 word_sections_preloaded=word_sections_preloaded,
             )
 
-            report_filename = f"{base_name}-层级匹配报告.xlsx"
-            report_path = os.path.join(output_dir, report_filename)
+            report_path = os.path.join(output_dir, f"{clean_name}_层级匹配报告.xlsx")
             saved_path = matcher.save_report(report, report_path)
             report["report_path"] = os.path.abspath(saved_path)
 
-            # [NEW] 同时保存JSON报告到单独的子文件夹
+            # 保存 JSON
             json_report_dir = os.path.join(output_dir, "json_reports")
-            if not os.path.exists(json_report_dir):
-                os.makedirs(json_report_dir, exist_ok=True)
-            json_report_filename = f"{base_name}-hierarchy_matching.json"
-            json_report_path = os.path.join(json_report_dir, json_report_filename)
+            if not os.path.exists(json_report_dir): os.makedirs(json_report_dir, exist_ok=True)
+            json_report_path = os.path.join(json_report_dir, "hierarchy_matching.json")
             try:
                 import json
                 with open(json_report_path, "w", encoding="utf-8") as f:
                     json.dump(report, f, ensure_ascii=False, indent=2)
                 report["json_report_path"] = json_report_path
-                if RuntimeLogger:
-                    RuntimeLogger.log(f"✓ JSON报告已保存: {json_report_path}", level="INFO")
             except Exception as e:
-                print(f"警告: 无法保存JSON报告: {e}")
+                log_error(f'警告: 无法保存JSON报告: {e}')
+
             return report
         except Exception as e:
-            print(f"层级匹配校验失败: {e}")
+            log_error(f'层级匹配校验失败: {e}')
             return {"is_valid": False, "error": str(e)}
 
     @staticmethod
@@ -3683,72 +3253,57 @@ class DocumentProcessor:
             fuzzy_match=True, threshold=0.8, progress_callback=None,
             word_sections_preloaded=None, project_name=None,
             hierarchy_mapping=None, preloaded_word_data=None,
+            report_base_name=None,
     ):
         """节点6：功能过程校验"""
         try:
             from docx import Document
+            from utils.initial_review_report import report_file_path
+
             doc = None
             word_file_path = word_path
             if hasattr(word_path, "paragraphs") and hasattr(word_path, "element"):
                 doc = word_path
-                if word_sections_preloaded:
-                    word_content = word_sections_preloaded
-                else:
-                    word_content = DocumentProcessor.extract_word_structure(doc)
+                word_content = word_sections_preloaded or DocumentProcessor.extract_word_structure(doc)
             else:
-                if word_sections_preloaded:
-                    word_content = word_sections_preloaded
-                else:
-                    word_content = DocumentProcessor.extract_word_structure(word_path)
+                word_content = word_sections_preloaded or DocumentProcessor.extract_word_structure(word_path)
 
             config = MatcherConfig.load()
             p_config = config.get("process", MatcherConfig.get_defaults()["process"])
             h_config = config.get("hierarchy", MatcherConfig.get_defaults()["hierarchy"])
             func_proc_col = func_col if func_col is not None else p_config.get("column", 6)
-            l1_col = h_config.get("level1_col", 1)
-            l2_col = h_config.get("level2_col", 2)
-            l3_col = h_config.get("level3_col", 3)
-            matcher = HierarchicalMatcher(fuzzy_match=fuzzy_match, threshold=threshold)
+            l1_col, l2_col, l3_col = h_config.get("level1_col", 1), h_config.get("level2_col", 2), h_config.get(
+                "level3_col", 3)
 
+            matcher = HierarchicalMatcher(fuzzy_match=fuzzy_match, threshold=threshold)
             target_sheet = sheet_name
             if target_sheet is None:
                 sheet_idx = p_config.get("sheet_name", 2)
                 try:
                     xl = pd.ExcelFile(excel_path)
                     sheet_names = xl.sheet_names
-                    if len(sheet_names) > sheet_idx:
-                        target_sheet = sheet_names[sheet_idx]
-                    elif len(sheet_names) > 0:
-                        target_sheet = sheet_names[0]
-                    else:
-                        target_sheet = 0
-                except Exception as e:
-                    print(f"Error checking excel structure: {e}")
+                    target_sheet = sheet_names[sheet_idx] if len(sheet_names) > sheet_idx else (
+                        sheet_names[0] if sheet_names else 0)
+                except:
                     target_sheet = 0
 
             try:
                 df_header = pd.read_excel(excel_path, sheet_name=target_sheet, nrows=0, header=header_row)
-                if func_proc_col >= len(df_header.columns):
-                    func_proc_col = 0
-            except Exception as e:
+                if func_proc_col >= len(df_header.columns): func_proc_col = 0
+            except:
                 pass
 
             preloaded_data = None
             if preloaded_word_data:
-                if "excel_data" in preloaded_word_data and preloaded_word_data["excel_data"]:
-                    excel_data = preloaded_word_data["excel_data"]
-                else:
-                    excel_data = matcher.extract_excel_content(
-                        excel_path, mode="flat", sheet_name=target_sheet, header=header_row,
-                        column=func_proc_col, level1_col=l1_col, level2_col=l2_col, level3_col=l3_col,
-                    )
-                preloaded_data = {
-                    "items": preloaded_word_data["items"], "excel_data": excel_data,
-                    "exact_lookup": preloaded_word_data["exact_lookup"],
-                    "toc_items": preloaded_word_data["toc_items"],
-                    "chapter_buckets": preloaded_word_data["chapter_buckets"],
-                    "full_text_content": preloaded_word_data.get("full_text_content", []),
-                }
+                excel_data = preloaded_word_data.get("excel_data") or matcher.extract_excel_content(excel_path,
+                                                                                                    mode="flat",
+                                                                                                    sheet_name=target_sheet,
+                                                                                                    header=header_row,
+                                                                                                    column=func_proc_col,
+                                                                                                    level1_col=l1_col,
+                                                                                                    level2_col=l2_col,
+                                                                                                    level3_col=l3_col)
+                preloaded_data = {**preloaded_word_data, "excel_data": excel_data}
 
             report = matcher.match_documents(
                 word_file_path, excel_path, sheet_name=target_sheet, header=header_row,
@@ -3759,86 +3314,65 @@ class DocumentProcessor:
                 preloaded_data=preloaded_data,
             )
 
-            if project_name:
-                clean_name = ReportGenerator._clean_project_name(project_name)
-            elif doc is not None or (hasattr(word_path, "paragraphs")):
-                clean_name = "word_document"
-            else:
-                clean_name = ReportGenerator._clean_project_name(word_path)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_name = f"{clean_name}_{timestamp}"
-            report_filename = f"{base_name}-功能过程报告.xlsx"
-
-            # ================= 【修改】使用项目专属目录自动归档 =================
-            from utils.path_utils import get_project_report_dir
-            output_dir = get_project_report_dir()
-            report_path = os.path.join(output_dir, report_filename)
-            # ====================================================================
+            # 【核心修复】统一路径模块生成本次运行时间戳文件夹内的报告路径
+            _, report_path = report_file_path(
+                report_type="功能过程报告",
+                project_name_or_path=project_name or word_path,
+                report_base_name=report_base_name,
+            )
 
             saved_path = matcher.save_report(report, report_path)
             report["report_path"] = os.path.abspath(saved_path)
             return report
         except Exception as e:
-            print(f"功能过程校验失败: {e}")
+            log_error(f'功能过程校验失败: {e}')
             return {"is_valid": False, "error": str(e)}
 
     @staticmethod
     def validate_data_movement_types(
             excel_path, sheet_name=None, header_row=0, func_col=6, move_col=8,
-            progress_callback=None, project_name=None,
+            progress_callback=None, project_name=None, report_base_name=None,
     ):
         """节点7：功能过程数据移动类型校验"""
         try:
+            import pandas as pd
+            from utils.initial_review_report import report_file_path
+
             df = pd.read_excel(excel_path, sheet_name=sheet_name, header=header_row)
             if func_col >= len(df.columns) or move_col >= len(df.columns):
                 return {"is_valid": False, "error": f"Excel 列索引越界"}
+
             df_process = df.copy()
             df_process.iloc[:, func_col] = df_process.iloc[:, func_col].ffill()
-            results = []
-            current_process = None
-            current_moves = []
-            process_rows = []
+            results, current_process, current_moves, process_rows = [], None, [], []
 
             def check_moves(moves):
                 if not moves: return "无数据移动"
                 valid_moves = [str(m).strip().upper() for m in moves if str(m).strip().upper() in ["E", "R", "W", "X"]]
                 if not valid_moves: return "缺少有效类型"
-                start_e = valid_moves[0] == "E"
-                end_wx = valid_moves[-1] in ["W", "X"]
-                if start_e and end_wx: return "合规"
-                if not start_e: return "缺少E"
-                if not end_wx: return "缺少X"
-                return "不合规"
+                if valid_moves[0] != "E": return "缺少E"
+                if valid_moves[-1] not in ["W", "X"]: return "缺少X"
+                return "合规"
 
             for idx, row in df_process.iterrows():
                 proc_val = str(row.iloc[func_col]).strip()
                 move_val = str(row.iloc[move_col]).strip()
-                if not proc_val or proc_val.lower() == "nan" or "体现了" in proc_val or "功能过程" in proc_val:
-                    continue
+                if not proc_val or proc_val.lower() == "nan" or "体现了" in proc_val or "功能过程" in proc_val: continue
                 if current_process != proc_val:
                     if current_process:
-                        check_res = check_moves(current_moves)
-                        results.append({
-                            "process": current_process, "moves": "".join(current_moves), "result": check_res,
-                            "row_range": (
-                                f"{process_rows[0] + header_row + 2}-{process_rows[-1] + header_row + 2}" if len(
-                                    process_rows) > 1 else f"{process_rows[0] + header_row + 2}"),
-                        })
-                    current_process = proc_val
-                    current_moves = []
-                    process_rows = []
-                m_upper = move_val.upper()
-                if m_upper in ["E", "R", "W", "X"]:
-                    current_moves.append(m_upper)
+                        results.append({"process": current_process, "moves": "".join(current_moves),
+                                        "result": check_moves(current_moves),
+                                        "row_range": f"{process_rows[0] + header_row + 2}-{process_rows[-1] + header_row + 2}" if len(
+                                            process_rows) > 1 else f"{process_rows[0] + header_row + 2}"})
+                    current_process, current_moves, process_rows = proc_val, [], []
+                if move_val.upper() in ["E", "R", "W", "X"]: current_moves.append(move_val.upper())
                 process_rows.append(idx)
 
             if current_process:
-                check_res = check_moves(current_moves)
-                results.append({
-                    "process": current_process, "moves": "".join(current_moves), "result": check_res,
-                    "row_range": (f"{process_rows[0] + header_row + 2}-{process_rows[-1] + header_row + 2}" if len(
-                        process_rows) > 1 else f"{process_rows[0] + header_row + 2}"),
-                })
+                results.append(
+                    {"process": current_process, "moves": "".join(current_moves), "result": check_moves(current_moves),
+                     "row_range": f"{process_rows[0] + header_row + 2}-{process_rows[-1] + header_row + 2}" if len(
+                         process_rows) > 1 else f"{process_rows[0] + header_row + 2}"})
 
             passed = sum(1 for r in results if r["result"] == "合规")
             failed = len(results) - passed
@@ -3846,42 +3380,34 @@ class DocumentProcessor:
 
             if len(results) > 0:
                 try:
-                    df_res = pd.DataFrame(results)
-                    df_res = df_res.rename(
+                    df_res = pd.DataFrame(results).rename(
                         columns={"process": "功能过程", "moves": "移动类型序列", "result": "校验结果",
                                  "row_range": "Excel行号"})
 
-                    if project_name:
-                        clean_name = ReportGenerator._clean_project_name(project_name)
-                    else:
-                        clean_name = ReportGenerator._clean_project_name(excel_path)
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    base_name = f"{clean_name}_{timestamp}"
-                    report_filename = f"{base_name}-数据移动类型报告.xlsx"
+                    # 【核心修复】统一路径模块生成本次运行时间戳文件夹内的报告路径
+                    _, report_path = report_file_path(
+                        report_type="数据移动类型报告",
+                        project_name_or_path=project_name or excel_path,
+                        report_base_name=report_base_name,
+                    )
 
-                    # ================= 【修改】使用项目专属目录自动归档 =================
-                    from utils.path_utils import get_project_report_dir
-                    output_dir = get_project_report_dir()
-                    report_path = os.path.join(output_dir, report_filename)
-
-                    # 处理重名
+                    # 防重名处理
                     counter = 1
+                    base_report_path = report_path
                     while os.path.exists(report_path):
-                        report_path = os.path.join(output_dir, f"{base_name}-数据移动类型报告({counter}).xlsx")
+                        name, ext = os.path.splitext(base_report_path)
+                        report_path = f"{name}({counter}){ext}"
                         counter += 1
-                    # ====================================================================
 
                     df_res.to_excel(report_path, index=False)
                     report_path = os.path.abspath(report_path)
                 except Exception as e:
-                    print(f"Error saving data movement report: {e}")
-            return {
-                "is_valid": failed == 0, "items": results,
-                "statistics": {"总数": len(results), "合规": passed, "不合规": failed},
-                "report_path": report_path,
-            }
+                    log_error(f'Error saving data movement report: {e}')
+
+            return {"is_valid": failed == 0, "items": results,
+                    "statistics": {"总数": len(results), "合规": passed, "不合规": failed}, "report_path": report_path}
         except Exception as e:
             import traceback
-            print(f"数据移动类型校验失败: {e}")
-            print(traceback.format_exc())
+            log_error(f'数据移动类型校验失败: {e}')
+            log_error(traceback.format_exc())
             return {"is_valid": False, "error": str(e)}

@@ -10,6 +10,11 @@ def get_light_theme_stylesheet():
     font_family = t.get("font_family", "Microsoft YaHei UI")
     font_size = t.get("font_size", 14)
 
+    # [P1] 新建任务类 CTA 按钮统一取 Design Token，三页保持一致
+    from utils.themes import get_tokens as _get_tokens
+
+    _tok = _get_tokens(False)
+
     bg_main = "#ffffff"
     bg_header = "#ffffff"
     text_color = "#000000"
@@ -205,36 +210,17 @@ def get_light_theme_stylesheet():
         background: white;
         border: 1px solid #e2e8f0;
     }}
-    QPushButton#UploadBtn {{
-        background: {primary};
+    /* 三个页面的新建任务按钮统一为同一种主按钮样式 */
+    QPushButton#UploadBtn, QPushButton#NewTaskBtn, QPushButton#ReceiptBtn {{
+        background-color: {_tok['accent']};
         color: white;
-        font-weight: bold;
-    }}
-    QPushButton#UploadBtn:hover {{
-        background: {primary};
-        filter: brightness(1.2);
-    }}
-    QPushButton#NewTaskBtn {{
-        background-color: #66ccff;
-        color: #ffffff;
-        border-radius: 6px;
-        font-weight: bold;
         border: none;
-    }}
-    QPushButton#NewTaskBtn:hover {{
-        background-color: #40b9e6;
-        filter: brightness(0.95);
-    }}
-    QPushButton#ReceiptBtn {{
-        background-color: #66ccff;
-        color: #ffffff;
-        border-radius: 6px;
+        border-radius: 8px;
+        padding: 8px 18px;
         font-weight: bold;
-        border: none;
     }}
-    QPushButton#ReceiptBtn:hover {{
-        background-color: #40b9e6;
-        filter: brightness(0.95);
+    QPushButton#UploadBtn:hover, QPushButton#NewTaskBtn:hover, QPushButton#ReceiptBtn:hover {{
+        background-color: {_tok['accent_hover']};
     }}
     QTextBrowser {{
         background-color: white;
@@ -242,12 +228,16 @@ def get_light_theme_stylesheet():
         border: 1px solid {border_color};
     }}
     QPushButton#ThemeBtn {{
-        background: white;
-        color: #64748b;
-        border: 1px solid {border_color};
+        background: transparent;
+        color: #334155;
+        border: 1px solid #d8dee9;
+        border-radius: 8px;
+        padding: 8px 16px;
+        font-weight: 600;
     }}
     QPushButton#ThemeBtn:hover {{
-        background: #f1f5f9;
+        background: #eef2f7;
+        border-color: #2563eb;
     }}
     QFrame#Sidebar {{
         background-color: #e8ecf1 !important;
@@ -285,24 +275,8 @@ def get_light_theme_stylesheet():
         background: #e0f2fe;
         transform: scale(0.95);
     }}
-    QComboBox::drop-down, QDateEdit::drop-down {{
-        subcontrol-origin: padding;
-        subcontrol-position: center right;
-        width: 24px;
-        border-left: none;
-    }}
-    QComboBox::down-arrow, QDateEdit::down-arrow {{
-        image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiM2NDc0OGIiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cG9seWxpbmUgcG9pbnRzPSI2IDkgMTIgMTUgMTggOSI+PC9wb2x5bGluZT48L3N2Zz4=);
-        width: 14px;
-        height: 14px;
-    }}
-    QComboBox QAbstractItemView {{
-        background-color: white;
-        color: {text_color};
-        border: 1px solid #e2e8f0;
-        selection-background-color: #f1f5f9;
-        outline: none;
-    }}
+    /* [P0] QComboBox / QDateEdit 箭头与弹层样式统一收敛到 utils.themes.control_qss，
+       此处不再重复定义，避免深浅色切换时两套规则打架 */
     /* 日历窗口适配 (亮色) */
     QCalendarWidget QWidget {{
         background-color: white;
@@ -310,38 +284,40 @@ def get_light_theme_stylesheet():
     }}
     QFrame#SidebarItem {{
         background: transparent;
-        border-radius: 8px;
+        border-left: 3px solid transparent;
+        border-radius: 6px;
         margin: 0 10px;
+        padding-left: 0px;
     }}
     QFrame#SidebarItem:hover {{
-        background: transparent;
+        background: #eef2f7;
     }}
     QFrame#SidebarItem[selected="true"] {{
-        background: #66ccff;
-        border-radius: 8px;
+        background: #dbeafe;
+        border-left: 3px solid #2563eb;
     }}
     /* 侧边栏文字 - 未选中状态 */
     QFrame#SidebarItem QLabel#SidebarItemText {{
-        color: #000000 !important;
+        color: #334155 !important;
         font-size: 14px;
-        font-weight: bold;
+        font-weight: 600;
     }}
     QFrame#SidebarItem QLabel#SidebarItemIcon {{
-        color: #000000 !important;
+        color: #334155 !important;
         font-size: 18px;
     }}
-    /* 侧边栏文字 - 选中状态 */
+    /* 侧边栏文字 - 选中状态 ([FIX] 淡蓝底配深蓝字，白字看不清) */
     QFrame#SidebarItem[selected="true"] QLabel#SidebarItemText {{
-        color: #ffffff !important;
+        color: #1d4ed8 !important;
         font-weight: bold;
     }}
     QFrame#SidebarItem[selected="true"] QLabel#SidebarItemIcon {{
-        color: #ffffff !important;
+        color: #1d4ed8 !important;
     }}
 
     /* 主题选择按钮 (设置页面) */
     QPushButton#ThemeLightBtn, QPushButton#ThemeDarkBtn {{
-        border: none;
+        border: 1px solid #e2e8f0;
         border-radius: 8px;
         background: transparent;
         color: #64748b;
@@ -369,7 +345,7 @@ def get_light_theme_stylesheet():
         font-weight: bold;
     }}
     QPushButton#PrimaryBtn:hover {{
-        filter: brightness(1.2);
+        background: #1d4ed8;
     }}
 
     QCheckBox, QRadioButton {{

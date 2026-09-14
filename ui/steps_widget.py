@@ -32,18 +32,33 @@ class StepCircle(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         # 居中绘制
-        rect = QRectF(4, 4, 36, 36)
+        rect = QRectF(5, 5, 34, 34)
 
         # 核心颜色定义 (移除黄色/警告，统一归为异常/红色)
+        # [P1] 待处理色随主题：深色下用更暗的灰，避免过亮喧宾夺主
+        # [P1] 状态色统一取自 Design Token（utils/themes.py）
+        try:
+            from extend.matcher_config import MatcherConfig
+            from utils.themes import get_tokens
+
+            _is_dark = MatcherConfig.load().get("theme", {}).get("is_dark", False)
+            _tok = get_tokens(_is_dark)
+        except Exception:
+            from utils.themes import get_tokens
+
+            _is_dark = False
+            _tok = get_tokens(False)
+        _pending = QColor("#475569") if _is_dark else QColor("#94a3b8")
+        _skipped = QColor("#334155") if _is_dark else QColor("#64748b")
         color_map = {
-            "pending": QColor("#94a3b8"),
-            "processing": QColor("#3b82f6"),
-            "done": QColor("#10b981"),
-            "finished": QColor("#10b981"),
-            "skipped": QColor("#64748b"),
-            "fail": QColor("#ef4444"),
-            "error": QColor("#ef4444"),
-            "warn": QColor("#ef4444"),  # 警告与错误均显示红色
+            "pending": _pending,
+            "processing": QColor(_tok["accent"]),
+            "done": QColor(_tok["success"]),
+            "finished": QColor(_tok["success"]),
+            "skipped": _skipped,
+            "fail": QColor(_tok["danger"]),
+            "error": QColor(_tok["danger"]),
+            "warn": QColor(_tok["danger"]),  # 警告与错误均显示红色
         }
 
         main_color = color_map.get(self.status, color_map["pending"])
@@ -106,7 +121,7 @@ class StepLine(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.progress = 0  # 0 to 100
-        self.setMinimumWidth(20)
+        self.setMinimumWidth(12)
         self.setFixedHeight(44)
 
         # 动画相关
@@ -129,11 +144,13 @@ class StepLine(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # 预加载主题色
+        # 预加载主题色 (统一取自 Design Token)
         from extend.matcher_config import MatcherConfig
+        from utils.themes import get_tokens
 
         config = MatcherConfig.load()
         is_dark = config.get("theme", {}).get("is_dark", False)
+        _tok = get_tokens(is_dark)
 
         # y 轴对齐：逻辑上圆圈中心在顶部的 10px margin + 22px 半径 = 32px
         # StepLine 作为 44px 高的 widget，如果顶对齐，其中线在 22px。
@@ -160,26 +177,27 @@ class StepLine(QWidget):
             fill_rect = QRectF(0, y - h / 2, fill_width, h)
 
             if self.progress >= 100:
-                # 完成色：翠绿色渐变 (统一使用 #10b981)
+                # 完成色：翠绿色渐变 (统一取 Token success)
                 grad = QLinearGradient(fill_rect.left(), 0, fill_rect.right(), 0)
-                grad.setColorAt(0, QColor("#10b981"))
-                grad.setColorAt(1, QColor("#10b981"))
+                grad.setColorAt(0, QColor(_tok["success"]))
+                grad.setColorAt(1, QColor(_tok["success"]))
             else:
-                # 进行色：科技蓝渐变，带流动能量感
+                # 进行色：主题蓝渐变，带流动能量感
                 self._glow_step = (self._glow_step + 1) % 40
                 shift = self._glow_step / 40.0
 
                 grad = QLinearGradient(fill_rect.left(), 0, fill_rect.right(), 0)
-                grad.setColorAt(max(0, shift - 0.3), QColor("#3b82f6"))
-                grad.setColorAt(shift, QColor("#93c5fd"))
-                grad.setColorAt(min(1, shift + 0.3), QColor("#3b82f6"))
+                grad.setColorAt(max(0, shift - 0.3), QColor(_tok["accent"]))
+                grad.setColorAt(shift, QColor(_tok["accent_light"]))
+                grad.setColorAt(min(1, shift + 0.3), QColor(_tok["accent"]))
 
             painter.setBrush(grad)
             painter.drawRoundedRect(fill_rect, h / 2, h / 2)
 
             # 3. 发光效果 (能量核流过感)
             if self.progress < 100:
-                glow_color = QColor(147, 197, 253, 60)
+                glow_color = QColor(_tok["accent_light"])
+                glow_color.setAlpha(60)
                 painter.setBrush(glow_color)
                 painter.drawRoundedRect(fill_rect.adjusted(-1, -1, 1, 1), h, h)
 
@@ -194,9 +212,9 @@ class StepNode(QWidget):
         super().__init__(parent)
         self.step_num = step_num
         self.status = status
-        # 弹性宽度，降低高度限制
-        self.setMinimumWidth(90)
-        self.setMaximumWidth(140)
+        # 弹性宽度：收窄最小宽度（10 个节点 + 连接线在 1200px 最小窗口也要放得下）
+        self.setMinimumWidth(56)
+        self.setMaximumWidth(128)
         self.setMinimumHeight(100)
 
         layout = QVBoxLayout(self)
@@ -229,17 +247,19 @@ class StepNode(QWidget):
         if status == "done" or status == "finished":
             self.circle.progress = 0  # 完成后清除环形进度
 
-        # 优化文字颜色与对比度 (Light/Dark Mode)
+        # 优化文字颜色与对比度 (Light/Dark Mode)，状态色取自 Design Token
         from extend.matcher_config import MatcherConfig
+        from utils.themes import get_tokens
 
         is_dark = MatcherConfig.load().get("theme", {}).get("is_dark", False)
+        _tok = get_tokens(is_dark)
 
         if status in ["done", "finished"]:
-            text_color = "#10b981"
+            text_color = _tok["success"]
         elif status in ["fail", "error", "warn"]:
-            text_color = "#ef4444"
+            text_color = _tok["danger"]
         elif status == "processing":
-            text_color = "#3b82f6"
+            text_color = _tok["accent"]
         elif status == "skipped":
             # skipped状态使用灰色，表示禁用/跳过
             text_color = "#94a3b8" if not is_dark else "#64748b"
@@ -340,39 +360,21 @@ class StepsWidget(QWidget):
         layout.addWidget(self.container)
 
     def set_total_progress(self, total_val):
-        """基于全局 0-100 的百分比更新所有线段和节点状态"""
+        """[FIX] 连线状态完全由节点完成状态驱动：
+        左侧节点已完成/已跳过 → 连线点亮；否则保持灰色，
+        杜绝“4 没完成 5 的线先绿”，同时跳过的节点不再打断进度链"""
         num_lines = len(self.step_lines)
         if num_lines == 0:
             return
 
-        # 增加容错：如果接近 100，直接设为 100
-        if total_val >= 99.8:
-            total_val = 100.0
-
-        # 采用与 ValidationWorker 任务分配点一致的非线性分段 (优化权重)
-        # 0:环境准备(0-15), 1:模板(15-30), 2:空值(30-33), 3:比例(33-36), 4:因子(36-39), 5:层级(39-70), 6:过程(70-95), 7:移动(95-96), 8:资产匹配(96-100)
-        breakpoints = [0, 15, 30, 33, 36, 39, 70, 95, 96, 100]
-
         for i, line in enumerate(self.step_lines):
-            if i >= len(breakpoints) - 1:
-                # 兜底处理
-                start_progress = 96
-                end_progress = 100
-            else:
-                start_progress = breakpoints[i]
-                end_progress = breakpoints[i + 1]
-
-            if total_val >= end_progress:
+            left_status = (
+                self.step_nodes[i].status if i < len(self.step_nodes) else "pending"
+            )
+            if left_status in ("done", "finished", "skipped"):
                 line.set_progress(100)
-            elif total_val <= start_progress:
-                line.set_progress(0)
             else:
-                # 在区间内
-                span = end_progress - start_progress
-                if span <= 0:
-                    span = 1
-                local_p = (total_val - start_progress) / span * 100
-                line.set_progress(local_p)
+                line.set_progress(0)
 
     def update_theme_style(self):
         """同步全局主题色"""

@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QMessageBox, QDialog,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon, QPalette
 from .task_card import TaskCard
 from .upload_dialog import UploadDialog  # ✅ 使用相对导入
@@ -30,6 +30,7 @@ from extend.matcher_config import MatcherConfig  # ✅ 导入配置类
 from utils.path_utils import get_resource_path, open_directory, clear_directory
 from utils.re_review_processor import ReReviewWorker  # ✅ 导入 Worker
 from utils.themes import get_theme_stylesheet, apply_dark_title_bar
+from utils.runtime_logger import log_info
 
 
 class CosmicMainWindow(QMainWindow):
@@ -39,6 +40,16 @@ class CosmicMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Cosmic 智能审核队列")
         self.setMinimumSize(1200, 800)
+
+        # 默认窗口尺寸：取可用屏幕的约 80%（上限 1560x960），保证侧边栏展开时
+        # 卡片内容也放得下；小屏自动回退到最小尺寸
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            self.resize(
+                max(1200, min(1560, int(avail.width() * 0.8))),
+                max(800, min(960, int(avail.height() * 0.85))),
+            )
 
         # 🚀 优先从配置加载主题状态，否则自适应系统
         config = MatcherConfig.load()
@@ -84,11 +95,17 @@ class CosmicMainWindow(QMainWindow):
         self.page_re_review = self._create_re_review_page()  # ✅ 使用正式的重评页面
         # self.page_evaluation = self._create_evaluation_page()  # ✅ 新增评估页面
         self.page_settings = SettingsWidget()  # ✅ 使用正式的设置页面
-
+        from .history_page import HistoryPage  # ✅ [NEW] 历史项目页
+        self.page_history = HistoryPage()
+        # [NEW] 历史项目：重新初评 / 断点续跑
+        self.page_history.re_run_requested.connect(self._history_re_run)
+        self.page_history.resume_requested.connect(self._history_resume)
+        
         self.stacked_widget.addWidget(self.page_home)
         self.stacked_widget.addWidget(self.page_initial_review)
         self.stacked_widget.addWidget(self.page_receipt)
         self.stacked_widget.addWidget(self.page_re_review)
+        self.stacked_widget.addWidget(self.page_history)
         # self.stacked_widget.addWidget(self.page_evaluation)
         self.stacked_widget.addWidget(self.page_settings)
 
@@ -102,8 +119,35 @@ class CosmicMainWindow(QMainWindow):
         # 应用初始主题
         self._apply_theme()
 
+
+
     def switch_page(self, index):
+        # [NEW] 进入历史项目页时自动刷新
+        if getattr(self, "page_history", None) is not None and index == 4:
+            self.stacked_widget.setCurrentIndex(index)
+            # 【优化】延迟刷新：先让页面完成绘制再启动后台扫描，点击切换不卡顿；
+            # 大任务运行期间 refresh 内部会自动降级为提示页
+            QTimer.singleShot(60, self.page_history.refresh)
+            return
         self.stacked_widget.setCurrentIndex(index)
+
+    def _history_re_run(self, raw_info):
+        """[NEW] 历史项目：打开新建审核任务对话框并预填上次的材料与选项，
+        用户可调整任意选项后自行点击开始"""
+        info = dict(raw_info or {})
+        info.pop("resume_state", None)
+        info.pop("resume_source_paused_path", None)
+        self.sidebar.on_item_clicked(1)
+        dialog = UploadDialog(self, prefill_info=info)
+        dialog.task_submitted.connect(self.add_new_task_and_navigate)
+        dialog.exec()
+
+    def _history_resume(self, raw_info):
+        """[NEW] 历史项目：从暂停进度继续执行"""
+        info = dict(raw_info or {})
+        if not info.get("resume_state"):
+            return
+        self.add_new_task_and_navigate(info)
 
     def _create_home_page(self):
         page = QWidget()
@@ -468,6 +512,24 @@ class CosmicMainWindow(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # [UI] 纵向滚动条细化并融入深浅色背景；横向兜底：卡片步骤条在极窄窗口下
+        # 允许出横向滚动条而不是把右侧按钮裁掉（执行过程中的自适应）
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet(
+            """
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
+            QScrollBar::handle:vertical { background: rgba(100,116,139,0.5); border-radius: 4px; min-height: 30px; }
+            QScrollBar::handle:vertical:hover { background: rgba(100,116,139,0.8); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; width: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+            QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px; }
+            QScrollBar::handle:horizontal { background: rgba(100,116,139,0.5); border-radius: 4px; min-width: 30px; }
+            QScrollBar::handle:horizontal:hover { background: rgba(100,116,139,0.8); }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { height: 0px; width: 0px; }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+            """
+        )
         scroll_content = QWidget()
         scroll_content.setObjectName("ScrollContent")
         self.task_layout = QVBoxLayout(scroll_content)
@@ -517,9 +579,9 @@ class CosmicMainWindow(QMainWindow):
             for i in range(self.re_review_task_layout.count()):
                 item = self.re_review_task_layout.itemAt(i)
                 if (
-                    item
-                    and item.widget()
-                    and isinstance(item.widget(), ReReviewTaskCard)
+                        item
+                        and item.widget()
+                        and isinstance(item.widget(), ReReviewTaskCard)
                 ):
                     item.widget().update_theme_style()
 
@@ -527,11 +589,20 @@ class CosmicMainWindow(QMainWindow):
             for i in range(self.receipt_task_layout.count()):
                 item = self.receipt_task_layout.itemAt(i)
                 if (
-                    item
-                    and item.widget()
-                    and isinstance(item.widget(), ReReviewTaskCard)
+                        item
+                        and item.widget()
+                        and isinstance(item.widget(), ReReviewTaskCard)
                 ):
                     item.widget().update_theme_style()
+
+        # 历史项目页：卡片样式是渲染时的快照，主题切换后必须整页重绘，
+        # 否则会出现深浅色卡片混杂
+        if hasattr(self, "page_history") and hasattr(self.page_history, "apply_theme"):
+            self.page_history.apply_theme()
+
+        # 设置页：区块标题/描述/清空等快照样式重刷
+        if hasattr(self, "page_settings") and hasattr(self.page_settings, "apply_theme"):
+            self.page_settings.apply_theme()
 
         # 应用原生标题栏深色模式
         apply_dark_title_bar(self, self.is_dark_mode)
@@ -605,14 +676,12 @@ class CosmicMainWindow(QMainWindow):
         open_dir_btn.setObjectName("ThemeBtn")  # 复用辅助按钮样式
         open_dir_btn.clicked.connect(self.open_initial_review_dir)
         btn_group.addWidget(open_dir_btn)
-        
+
         upload_btn = QPushButton("新建审核任务")
         upload_btn.setObjectName("UploadBtn")
         # 移除硬编码样式
         upload_btn.clicked.connect(self.show_upload_dialog)
         btn_group.addWidget(upload_btn)
-
-
 
         header_layout.addLayout(btn_group)
 
@@ -677,6 +746,7 @@ class CosmicMainWindow(QMainWindow):
             step1_status = "done"  # 示例简化
 
         # ✅ 10 个步骤，加入环境准备节点 0 和数据属性重复检测节点 9
+        # 标签尽量 4-6 字，避免换行撑高步骤条
         steps = [
             ("环境准备", "pending"),
             ("模板校验", "pending"),
@@ -685,9 +755,9 @@ class CosmicMainWindow(QMainWindow):
             ("附加值因子", "pending"),
             ("层级匹配", "pending"),
             ("功能过程", "pending"),
-            ("功能过程数据移动类型", "pending"),
-            ("资产清单匹配", "pending"),
-            ("数据属性重复检测", "pending"),
+            ("数据移动类型", "pending"),
+            ("资产清单", "pending"),
+            ("属性查重", "pending"),
         ]
 
         logs = {
@@ -717,6 +787,10 @@ class CosmicMainWindow(QMainWindow):
             "logs": logs,  # ✅ 1~6 键完整
             "report_sections": [],  # 新任务暂无报告，但字段存在（兼容 ReportDialog）
             "raw_task_info": task_info,  # 保留原始数据
+            # [NEW] 断点续跑：历史页"继续执行"传来的 resume_state 提到 task_data 顶层，
+            #   TaskCard 可直接读取以从 completed_through 步继续
+            #   （raw_task_info["resume_state"] 原位置仍保留，两处等价）
+            "resume_state": task_info.get("resume_state"),
         }
 
         # 创建卡片并插入顶部
@@ -744,7 +818,6 @@ class CosmicMainWindow(QMainWindow):
 
         self.re_review_btn = QPushButton("新建重评任务")
         self.re_review_btn.setObjectName("NewTaskBtn")
-        self.re_review_btn.setFixedSize(140, 40)
 
         self.re_review_btn.clicked.connect(self.show_re_review_dialog)
         header_layout.addWidget(self.re_review_btn)
@@ -793,17 +866,25 @@ class CosmicMainWindow(QMainWindow):
         )
 
         # 保持引用防止被垃圾回收
+        # 【崩溃修复】严禁在自定义 finished/error 信号回调里把 worker 移出列表：
+        # 这两个信号在 run() 内部 emit，此时线程可能仍在执行收尾代码，
+        # 移除最后一个引用会销毁运行中的 QThread → Qt qFatal 闪退(0xc0000409)。
+        # 改为：仅清理【已真正结束】(isRunning()=False) 的旧 worker。
         if not hasattr(self, "re_review_workers"):
             self.re_review_workers = []
+        self.re_review_workers = [
+            w for w in self.re_review_workers if w.isRunning()
+        ]
         self.re_review_workers.append(worker)
 
         worker.progress.connect(card.update_progress)
         worker.finished.connect(lambda paths: card.set_completed(paths[0], paths[1]))
         worker.error.connect(card.set_error)
-        worker.finished.connect(lambda: self.re_review_workers.remove(worker))
-        worker.error.connect(lambda: self.re_review_workers.remove(worker))
 
-        worker.start()
+        # [NEW] 经队列管理器按并发配置启动
+        from utils.task_queue import TaskQueueManager
+
+        TaskQueueManager().submit("re_review", worker)
 
     def _create_receipt_page(self):
         """创建回单页面"""
@@ -826,7 +907,6 @@ class CosmicMainWindow(QMainWindow):
 
         self.receipt_btn = QPushButton("新增确认单")
         self.receipt_btn.setObjectName("ReceiptBtn")
-        self.receipt_btn.setFixedSize(140, 40)
         self.receipt_btn.clicked.connect(self.show_receipt_dialog)
         header_layout.addWidget(self.receipt_btn)
 
@@ -877,9 +957,9 @@ class CosmicMainWindow(QMainWindow):
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "status_text": "等待处理..." if is_batch and i > 0 else "正在处理...",
             }
-            card = ReReviewTaskCard(task_info)
-            card.excel1_btn.setText("评估报告(已回写)")
-            card.excel2_btn.setText("评估确认单(Word)")
+            card = ReReviewTaskCard(task_info, card_type="receipt")
+            card.excel1_btn.setText("📊 评估报告(已回写)")
+            card.excel2_btn.setText("📋 评估确认单(Word)")
             new_cards.append(card)
             card_map[i] = card
 
@@ -965,9 +1045,9 @@ class CosmicMainWindow(QMainWindow):
                 output_dir = MatcherConfig.load().get("storage", {}).get("receipt")
                 if output_dir and os.path.exists(output_dir):
                     if (
-                        MatcherConfig.load()
-                        .get("automation", {})
-                        .get("auto_open", True)
+                            MatcherConfig.load()
+                                    .get("automation", {})
+                                    .get("auto_open", True)
                     ):
                         open_directory(output_dir)
 
@@ -983,10 +1063,17 @@ class CosmicMainWindow(QMainWindow):
                     card.set_error(msg)
 
         worker.error.connect(on_error)
-        worker.finished.connect(lambda: self.receipt_workers.remove(worker))
-        worker.error.connect(lambda: self.receipt_workers.remove(worker))
+        # 【崩溃修复】不在信号回调里移除 worker（信号在 run() 内部发出，移除最后一个
+        # 引用会销毁运行中的 QThread → qFatal 闪退）；改为创建新 worker 时清理已结束的
+        if not hasattr(self, "receipt_workers"):
+            self.receipt_workers = []
+        self.receipt_workers = [w for w in self.receipt_workers if w.isRunning()]
+        self.receipt_workers.append(worker)
 
-        worker.start()
+        # [NEW] 经队列管理器按并发配置启动
+        from utils.task_queue import TaskQueueManager
+
+        TaskQueueManager().submit("receipt", worker)
 
     def _create_evaluation_page(self):
         """创建评估页面"""
@@ -1043,10 +1130,10 @@ class CosmicMainWindow(QMainWindow):
         """启动评估任务并显示卡片"""
         # 1. 添加卡片并跳转
         self.add_evaluation_task(task_info)
-        
+
         # 2. 启动后台 Worker
         from utils.evaluation_processor import EvaluationWorker
-        
+
         # 查找刚才添加的卡片以更新状态
         card = None
         for i in range(self.evaluation_task_layout.count()):
@@ -1055,7 +1142,7 @@ class CosmicMainWindow(QMainWindow):
                 if item.widget().task_id == task_info["task_id"]:
                     card = item.widget()
                     break
-        
+
         if not card:
             return
 
@@ -1071,26 +1158,28 @@ class CosmicMainWindow(QMainWindow):
 
         if not hasattr(self, "evaluation_workers"):
             self.evaluation_workers = []
+        # 【崩溃修复】不在信号回调里移除 worker（同 re_review），改为清理已结束的
+        self.evaluation_workers = [
+            w for w in self.evaluation_workers if w.isRunning()
+        ]
         self.evaluation_workers.append(worker)
 
         # 连接 Worker 信号
         def on_finished(output_path):
             card.update_status("已完成")
-            # 记录当前日志路径到卡片
+            # 记录当前日志路径到卡片（按项目查询项目日志）
             from utils.runtime_logger import RuntimeLogger
-            log_path = RuntimeLogger.get_current_log_path()
+            log_path = RuntimeLogger.get_current_log_path(task_info.get("project_name"))
             card.log_path = log_path
-            
+
             card.set_output_file(output_path)
             # 在卡片上更新
             card.view_btn.setVisible(True)
             card.log_btn.setVisible(True)
-            self.evaluation_workers.remove(worker)
 
         def on_error(msg):
             card.update_status("失败")
             QMessageBox.critical(self, "评估出错", f"项目 {task_info['project_name']} 评估失败:\n{msg}")
-            self.evaluation_workers.remove(worker)
 
         # 新增项目：处理人工验证请求
         def on_verify_requested(results, callback):
@@ -1106,7 +1195,7 @@ class CosmicMainWindow(QMainWindow):
         worker.error.connect(on_error)
         worker.verify_requested.connect(on_verify_requested)
         worker.start()
-        
+
         card.update_status("评估中...")
 
     def add_evaluation_task(self, task_info):
@@ -1152,12 +1241,37 @@ class CosmicMainWindow(QMainWindow):
             for i in range(self.evaluation_task_layout.count()):
                 item = self.evaluation_task_layout.itemAt(i)
                 if (
-                    item
-                    and item.widget()
-                    and isinstance(item.widget(), EvaluationTaskCard)
+                        item
+                        and item.widget()
+                        and isinstance(item.widget(), EvaluationTaskCard)
                 ):
                     if item.widget().task_id == task_id:
                         widget = item.widget()
                         self.evaluation_task_layout.removeWidget(widget)
                         widget.deleteLater()
                         break
+
+    def closeEvent(self, event):
+        """[NEW] 拦截窗口关闭，优雅停止后台任务并保存进度"""
+        log_info('[CloseEvent] 检测到窗口关闭，正在保存任务进度...')
+
+        # 1. 停止所有正在运行的初评任务
+        if hasattr(self, "task_layout"):
+            for i in range(self.task_layout.count()):
+                item = self.task_layout.itemAt(i)
+                if item and item.widget() and hasattr(item.widget(), "worker"):
+                    card = item.widget()
+                    if card.worker and card.worker.isRunning():
+                        log_info(f"[CloseEvent] 正在停止任务: {card.task_data.get('filename')}")
+                        # 触发停止标志
+                        card.worker.stop()
+                        card.worker._is_running = False
+                        card.is_running = False
+
+                        # [核心] 等待线程结束，给 finally 块时间执行 _dump_pause_state
+                        # 最多等待 5 秒，防止程序卡死
+                        card.worker.wait(5000)
+
+                        # 2. 接受关闭事件
+        event.accept()
+        log_info('[CloseEvent] 进度保存完毕，程序关闭。')

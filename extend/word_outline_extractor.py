@@ -11,6 +11,19 @@ import re  # 新增：用于手动编号提取
 from typing import List, Tuple
 import time  # 新增：用于性能监测
 
+# 优先使用项目统一日志；作为独立脚本从 extend/ 目录直接运行时降级为 print
+try:
+    from utils.runtime_logger import log_error, log_info, log_warn
+except ImportError:
+    def log_info(*parts, sep=" "):
+        print(sep.join(str(p) for p in parts))
+
+    def log_warn(*parts, sep=" "):
+        print(sep.join(str(p) for p in parts))
+
+    def log_error(*parts, sep=" "):
+        print(sep.join(str(p) for p in parts))
+
 
 def extract_word_outline(doc_path: str, max_level: int = 9) -> List[Tuple[str, str, int]]:
     """
@@ -123,41 +136,37 @@ def extract_word_outline(doc_path: str, max_level: int = 9) -> List[Tuple[str, s
 def print_word_outline(outline: List[Tuple[str, str, int]]) -> None:
     """简洁输出大纲结构"""
     if not outline:
-        print("\n⚠️ 未提取到任何大纲项")
-        print("💡 请在 Word 中验证：【视图】→【大纲】是否显示层级结构")
+        log_warn('\n⚠️ 未提取到任何大纲项')
+        log_info('💡 请在 Word 中验证：【视图】→【大纲】是否显示层级结构')
         return
 
-    print(f"\n{'=' * 70}")
-    print("Word 大纲视图 (OutlineLevel 1-9)")
-    print(f"{'=' * 70}\n")
+    log_info(f"\n{'=' * 70}")
+    log_info('Word 大纲视图 (OutlineLevel 1-9)')
+    log_info(f"{'=' * 70}\n")
 
     for num, title, level in outline:
         indent = '  ' * (level - 1)
         if num:
-            print(f'{indent}[{num}] {title}')
+            log_info(f'{indent}[{num}] {title}')
         else:
-            print(f'{indent}[] {title}')  # 显式显示空编号
+            log_info(f'{indent}[] {title}')  # 显式显示空编号
 
     from collections import Counter
     level_dist = Counter(level for _, _, level in outline)
-    print(f"\n{'=' * 70}")
-    print(f"✓ 共 {len(outline)} 项 | 级别分布: ", end=" ")
-    for lvl in sorted(level_dist.keys()):
-        print(f"L{lvl}:{level_dist[lvl]}  ", end=" ")
-    print()
-    print(f"{'=' * 70}")
+    dist_str = "  ".join(f"L{lvl}:{level_dist[lvl]}" for lvl in sorted(level_dist.keys()))
+    log_info(f"✓ 共 {len(outline)} 项 | 级别分布: {dist_str}")
 
 
 if __name__ == "__main__":
     import sys
 
     doc_path = sys.argv[1] if len(sys.argv) > 1 else input("请输入Word文档路径: ")
-    print("正在提取 Word 大纲（OutlineLevel 1-9）...")
+    log_info('正在提取 Word 大纲（OutlineLevel 1-9）...')
     try:
         outline = extract_word_outline(doc_path, max_level=9)
         print_word_outline(outline)
     except Exception as e:
-        print(f"❌ 提取失败: {str(e)}")
+        log_error(f'❌ 提取失败: {str(e)}')
         import traceback
 
         traceback.print_exc()

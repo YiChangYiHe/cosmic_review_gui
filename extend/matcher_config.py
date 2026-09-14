@@ -1,6 +1,9 @@
 import json
 import os
+import copy
+import time
 from utils.path_utils import get_resource_path
+from utils.runtime_logger import log_error
 
 
 class MatcherConfig:
@@ -11,9 +14,14 @@ class MatcherConfig:
         os.makedirs(_USER_DIR, exist_ok=True)
 
     _USER_CONFIG = os.path.join(_USER_DIR, "matcher_config.json")
-    
+
     # 当前实际使用的配置文件路径
     CONFIG_FILE = _LOCAL_CONFIG if os.path.exists(_LOCAL_CONFIG) else _USER_CONFIG
+
+    # [性能] 短 TTL 缓存：load() 被绘制/动画等高频路径调用（步骤条动画每 50ms
+    # 触发多次），每次都读磁盘 + 解析 JSON 会让 UI 线程持续做 IO。
+    _CACHE_TTL = 1.0  # 秒
+    _load_cache = None  # {"file", "mtime", "ts", "config"}
 
     @classmethod
     def load(cls):
@@ -22,16 +30,32 @@ class MatcherConfig:
             cls.CONFIG_FILE = cls._LOCAL_CONFIG
         else:
             cls.CONFIG_FILE = cls._USER_CONFIG
-            
+
+        cfg_file = cls.CONFIG_FILE
+        try:
+            mtime = os.path.getmtime(cfg_file) if os.path.exists(cfg_file) else None
+        except OSError:
+            mtime = None
+
+        cached = cls._load_cache
+        if (
+            cached
+            and cached["file"] == cfg_file
+            and cached["mtime"] == mtime
+            and time.monotonic() - cached["ts"] < cls._CACHE_TTL
+        ):
+            # 调用方会修改返回值（改完再 save），必须给副本
+            return copy.deepcopy(cached["config"])
+
         config = cls.get_defaults()
-        if os.path.exists(cls.CONFIG_FILE):
+        if os.path.exists(cfg_file):
             try:
-                with open(cls.CONFIG_FILE, "r", encoding="utf-8") as f:
+                with open(cfg_file, "r", encoding="utf-8") as f:
                     user_config = json.load(f)
                     # 深度更新配置
                     cls._deep_update(config, user_config)
             except Exception as e:
-                print(f"Error loading config: {e}")
+                log_error(f'Error loading config: {e}')
 
         # 统一路径格式
         if "storage" in config:
@@ -39,7 +63,13 @@ class MatcherConfig:
                 if path:
                     config["storage"][key] = os.path.normpath(path)
 
-        return config
+        cls._load_cache = {
+            "file": cfg_file,
+            "mtime": mtime,
+            "ts": time.monotonic(),
+            "config": config,
+        }
+        return copy.deepcopy(config)
 
     @staticmethod
     def _deep_update(d, u):
@@ -56,11 +86,13 @@ class MatcherConfig:
             # 在保存时也检查一下路径
             if os.path.exists(cls._LOCAL_CONFIG):
                 cls.CONFIG_FILE = cls._LOCAL_CONFIG
-            
+
             with open(cls.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)
+            # 保存后立即失效缓存，让下一次 load 读到最新内容
+            cls._load_cache = None
         except Exception as e:
-            print(f"Error saving config: {e}")
+            log_error(f'Error saving config: {e}')
 
     @classmethod
     def get_defaults(cls):
@@ -72,7 +104,6 @@ class MatcherConfig:
                 "level2_col": 2,
                 "level3_col": 3,
                 "sheet_name": 2,  # Default to 3rd sheet (index 2)
-                "auto_numbering": False,  # 【新增】默认不自动标号，保留文本中的手动编号
             },
             "process": {
                 "column": 6,  # Default functional process column (7th column, index 6)
@@ -93,7 +124,6 @@ class MatcherConfig:
                 "font_size": 14,
                 "is_dark": False,
             },
-            "log_level": "DETAILED_LOG",  # <--- 【新增】默认日志级别
             "automation": {
                 "auto_open": True,
                 "reuse_threshold": 70  # 全篇复用模糊匹配阈值 (0-100)
@@ -110,15 +140,5 @@ class MatcherConfig:
                 "erx_reuse_keywords": ["查询", "查看", "导出"],
                 "non_functional": ["数据收集", "清洗", "标注", "模型构建", "微调", "部署", "搬迁", "系统迁移", "背景", "文案", "像素"],
                 "legacy_keywords": ["利旧", "内存", "缓存", "校验", "由于"]
-            },
-            "title_cleanup": {
-                "suffix_keywords": [
-                    "一级功能模块", "二级功能模块", "三级功能模块",
-                    "功能模块", "模块"
-                ],
-                "regex_patterns": [
-                    r"[（(][一二三级123]+[级]?功能模块[)）]",
-                    r"[（(][一二三级123]+级[)）]"
-                ]
             }
         }

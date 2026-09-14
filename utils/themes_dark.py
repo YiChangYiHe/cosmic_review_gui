@@ -10,6 +10,11 @@ def get_dark_theme_stylesheet():
     font_family = t.get("font_family", "Microsoft YaHei UI")
     font_size = t.get("font_size", 14)
 
+    # [P1] 新建任务类 CTA 按钮统一取 Design Token，三页保持一致
+    from utils.themes import get_tokens as _get_tokens
+
+    _cta = _get_tokens(True)
+
     bg_main = "#1f2937"
     bg_header = "#111827"
     text_color = t.get("text_color_dark", "#f3f4f6")
@@ -221,6 +226,8 @@ def get_dark_theme_stylesheet():
         border: none;
         padding: 0;
     }}
+    /* [P0] QComboBox / QDateEdit 箭头与弹层样式统一收敛到 utils.themes.control_qss，
+       此处不再重复定义，避免深浅色切换时两套规则打架 */
     QPushButton {{
         border-radius: 6px;
         padding: 8px 16px;
@@ -228,36 +235,17 @@ def get_dark_theme_stylesheet():
         background: {border_color};
         border: 1px solid #4b5563;
     }}
-    QPushButton#UploadBtn {{
-        background: {primary};
+    /* 三个页面的新建任务按钮统一为同一种主按钮样式（取 Design Token） */
+    QPushButton#UploadBtn, QPushButton#NewTaskBtn, QPushButton#ReceiptBtn {{
+        background-color: {_cta['accent']};
         color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 8px 18px;
         font-weight: bold;
     }}
-    QPushButton#UploadBtn:hover {{
-        background: {primary};
-        filter: brightness(1.2);
-    }}
-    QPushButton#NewTaskBtn {{
-        background-color: #1f2937;
-        color: #f1f5f9;
-        border-radius: 6px;
-        font-weight: bold;
-        border: 1px solid #374151;
-    }}
-    QPushButton#NewTaskBtn:hover {{
-        background-color: #374151;
-        border: 1px solid #60a5fa;
-    }}
-    QPushButton#ReceiptBtn {{
-        background-color: #1f2937;
-        color: #f1f5f9;
-        border-radius: 6px;
-        font-weight: bold;
-        border: 1px solid #374151;
-    }}
-    QPushButton#ReceiptBtn:hover {{
-        background-color: #374151;
-        border: 1px solid #60a5fa;
+    QPushButton#UploadBtn:hover, QPushButton#NewTaskBtn:hover, QPushButton#ReceiptBtn:hover {{
+        background-color: {_cta['accent_hover']};
     }}
     QTextBrowser {{
         background-color: {item_bg};
@@ -265,14 +253,18 @@ def get_dark_theme_stylesheet():
         border: 1px solid {border_color};
     }}
     QPushButton#ThemeBtn {{
-        background: {border_color};
-        color: #d1d5db;
-        border: 1px solid #4b5563;
+        background: transparent;
+        color: #cbd5e1;
+        border: 1px solid #293548;
+        border-radius: 8px;
+        padding: 8px 16px;
+        font-weight: 600;
     }}
     QPushButton#ThemeBtn:hover {{
-        background: #4b5563;
+        background: #1e293b;
+        border-color: #3b82f6;
     }}
-    QScrollArea, QScrollArea QWidget {{
+    QScrollArea, QScrollArea > QWidget > QWidget {{
         background-color: {bg_main};
     }}
     QScrollArea {{
@@ -302,24 +294,6 @@ def get_dark_theme_stylesheet():
         background: #66ccff;
         border-color: #66ccff;
         image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI1IiBmaWxsPSJ3aGl0ZSIvPjwvc3ZnPg==);
-    }}
-    QComboBox::drop-down, QDateEdit::drop-down {{
-        subcontrol-origin: padding;
-        subcontrol-position: center right;
-        width: 24px;
-        border-left: none;
-    }}
-    QComboBox::down-arrow, QDateEdit::down-arrow {{
-        image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiM5Y2EzYWYiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cG9seWxpbmUgcG9pbnRzPSI2IDkgMTIgMTUgMTggOSI+PC9wb2x5bGluZT48L3N2Zz4=);
-        width: 14px;
-        height: 14px;
-    }}
-    QComboBox QAbstractItemView {{
-        background-color: {bg_main};
-        color: {text_color};
-        border: 1px solid #4b5563;
-        selection-background-color: {border_color};
-        outline: none;
     }}
     /* 日历窗口适配 */
     QCalendarWidget QWidget {{
@@ -386,21 +360,22 @@ def get_dark_theme_stylesheet():
     }}
     QFrame#SidebarItem {{
         background: transparent;
-        border-radius: 8px;
+        border-left: 3px solid transparent;
+        border-radius: 6px;
         margin: 0 10px;
     }}
     QFrame#SidebarItem:hover {{
         background: #1e293b;
     }}
     QFrame#SidebarItem[selected="true"] {{
-        background: #66ccff;
-        border-radius: 8px;
+        background: rgba(59, 130, 246, 0.18);
+        border-left: 3px solid #3b82f6;
     }}
     /* 侧边栏文字 - 未选中状态 */
     QFrame#SidebarItem QLabel#SidebarItemText {{
-        color: #f3f4f6 !important;
+        color: #cbd5e1 !important;
         font-size: 14px;
-        font-weight: bold;
+        font-weight: 600;
     }}
     QFrame#SidebarItem QLabel#SidebarItemIcon {{
         color: #f3f4f6 !important;
@@ -408,16 +383,16 @@ def get_dark_theme_stylesheet():
     }}
     /* 侧边栏文字 - 选中状态 */
     QFrame#SidebarItem[selected="true"] QLabel#SidebarItemText {{
-        color: #ffffff !important;
+        color: #f8fafc !important;
         font-weight: bold;
     }}
     QFrame#SidebarItem[selected="true"] QLabel#SidebarItemIcon {{
-        color: #ffffff !important;
+        color: #f8fafc !important;
     }}
 
     /* 主题选择按钮 (设置页面) */
     QPushButton#ThemeLightBtn, QPushButton#ThemeDarkBtn {{
-        border: none;
+        border: 1px solid #293548;
         border-radius: 8px;
         background: #111827;
         color: #9ca3af;
@@ -470,7 +445,7 @@ def get_dark_theme_stylesheet():
         font-weight: bold;
     }}
     QPushButton#PrimaryBtn:hover {{
-        filter: brightness(1.2);
+        background: #2f6fe0;
     }}
 
     /* 复选框增强 (深色) */

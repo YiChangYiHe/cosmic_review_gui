@@ -24,10 +24,14 @@
         "font_size": 14,
         "is_dark": true
     },
-    "log_level": "INFO",
     "automation": {
         "auto_open": false,
-        "reuse_threshold": 80
+        "notify_flags": {
+            "in_app": false,
+            "popup": false,
+            "tray": true
+        },
+        "reuse_threshold": 52
     },
     "evaluation_folder": "E:\\work\\code\\work\\comsic_training\\data\\raw",
     "evaluation_rules": {
@@ -131,6 +135,15 @@
             "由于"
         ]
     },
+    "log_level": "INFO",
+    "queue": {
+        "initial_concurrency": 2,
+        "re_review_concurrency": 1,
+        "receipt_concurrency": 1,
+        "memory_threshold_percent": 75,
+        "memory_rss_limit_mb": 3072
+    },
+    "history_display_mode": "flat",
     "title_cleanup": {
         "suffix_keywords": [
             "一级功能模块",

@@ -1,5 +1,6 @@
 import sys
 import os
+from utils.runtime_logger import log_error
 
 # 样式常量定义
 COLORS = {
@@ -47,4 +48,4 @@ def apply_dark_title_bar(window, is_dark=True):
             ctypes.sizeof(value)
         )
     except Exception as e:
-        print(f"Set dark title bar failed: {e}")
+        log_error(f'Set dark title bar failed: {e}')

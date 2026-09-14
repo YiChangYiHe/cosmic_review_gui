@@ -24,6 +24,9 @@ from collections import Counter
 from datetime import datetime  # 修复 datetime 错误
 from extend.matcher_config import MatcherConfig
 from utils.runtime_logger import RuntimeLogger
+import utils.fast_tree_extractor as fast_tree_extractor
+import utils.tree_cache as tree_cache
+from utils.runtime_logger import log_debug, log_error, log_info, log_warn
 
 DETAILED_LOG = False
 
@@ -37,16 +40,15 @@ try:
 
     WIN32COM_AVAILABLE = True
 except ImportError:
-    print(
-        "WARNING: 'pywin32' 库未找到。在非 Windows 环境或未安装该库时，.doc 到 .docx 转换功能将不可用。"
-    )
-    print("请确保在 Windows 上运行，并已安装 'pywin32' (pip install pywin32)。")
+    log_error("WARNING: 'pywin32' 库未找到。在非 Windows 环境或未安装该库时，.doc 到 .docx 转换功能将不可用。")
+    log_error("请确保在 Windows 上运行，并已安装 'pywin32' (pip install pywin32)。")
     WIN32COM_AVAILABLE = False
-
 
 # -----------------------------------------------------------------------------
 # 辅助函数：将 .doc 文件转换为 .docx
 # -----------------------------------------------------------------------------
+
+
 def convert_doc_to_docx(doc_path: str) -> str:
     """
     将 .doc 文件转换为 .docx 文件。
@@ -71,7 +73,7 @@ def convert_doc_to_docx(doc_path: str) -> str:
     # 确保临时文件名唯一，避免冲突
     docx_path = Path(temp_dir) / (doc_path_obj.stem + f"_{os.urandom(4).hex()}.docx")
 
-    print(f"  正在将 '{doc_path_obj.name}' (.doc) 转换为 '{docx_path.name}' (.docx)...")
+    log_info(f"  正在将 '{doc_path_obj.name}' (.doc) 转换为 '{docx_path.name}' (.docx)...")
 
     word = None
     try:
@@ -82,10 +84,10 @@ def convert_doc_to_docx(doc_path: str) -> str:
         # FileFormat=16 代表 wdFormatXMLDocument (docx 格式)
         doc.SaveAs(str(docx_path), FileFormat=16)
         doc.Close()
-        print(f"  ✓ 转换成功，临时文件: {docx_path}")
+        log_info(f'  ✓ 转换成功，临时文件: {docx_path}')
         return str(docx_path)
     except Exception as e:
-        print(f"  ✗ .doc 到 .docx 转换失败: {e}")
+        log_error(f'  ✗ .doc 到 .docx 转换失败: {e}')
         # 如果转换失败，删除可能创建的临时文件
         if docx_path.exists():
             os.remove(docx_path)
@@ -109,10 +111,11 @@ def is_descendant(parent_num: str, child_num: str) -> bool:
         return True
     return c.startswith(p + ".")
 
-
 # -----------------------------------------------------------------------------
 # HierarchicalMatcher 类
 # -----------------------------------------------------------------------------
+
+
 class HierarchicalMatcher:
     """层级匹配器类"""
 
@@ -167,6 +170,17 @@ class HierarchicalMatcher:
         self._excel_cache = {}  # Excel数据缓存
         self._index_cache = {}  # 索引缓存
 
+    # 内存中最多保留的 Word 数据缓存条数（每条含全文内容，
+    # 300M 级文档场景下防止缓存无界增长导致内存溢出）
+    WORD_CACHE_LIMIT = 2
+
+    def _cache_word_data(self, cache_key, data):
+        """写入 Word 数据缓存；超过上限时按 FIFO 逐出最旧条目"""
+        self._word_cache[cache_key] = data
+        while len(self._word_cache) > self.WORD_CACHE_LIMIT:
+            oldest = next(iter(self._word_cache))
+            self._word_cache.pop(oldest, None)
+
     def _get_outline_level_safe(self, para) -> int:
         """
         安全获取段落的大纲级别 (Outline Level)。
@@ -209,14 +223,70 @@ class HierarchicalMatcher:
 
         return None
 
+    def _make_cached_word_data(self, word_items, full_text_content, word_path):
+        """构建预处理缓存数据（内存结构），并同步设置全文流索引"""
+        exact_lookup, toc_items, chapter_buckets = self._build_word_index(
+            word_items, full_text_content
+        )
+        self.word_full_flow = full_text_content or []
+        self.number_to_flow_idx = {
+            item["number"]: i
+            for i, item in enumerate(self.word_full_flow)
+            if item.get("number")
+        }
+        return {
+            "items": word_items,
+            "exact_lookup": exact_lookup,
+            "toc_items": toc_items,
+            "chapter_buckets": chapter_buckets,
+            "full_text_content": full_text_content,
+            "mtime": (
+                os.path.getmtime(word_path) if os.path.exists(word_path) else 0
+            ),
+        }
+
+    def _hydrate_disk_cache(self, payload):
+        """从磁盘缓存 payload 恢复预处理数据（索引重建为线性开销）"""
+        try:
+            items = payload.get("items", [])
+            full_text = payload.get("full_text_content", [])
+            if not items:
+                return None
+            exact_lookup, toc_items, chapter_buckets = self._build_word_index(
+                items, full_text, merge_content=False
+            )
+            self.word_full_flow = full_text or []
+            self.number_to_flow_idx = {
+                item["number"]: i
+                for i, item in enumerate(self.word_full_flow)
+                if item.get("number")
+            }
+            return {
+                "items": items,
+                "exact_lookup": exact_lookup,
+                "toc_items": toc_items,
+                "chapter_buckets": chapter_buckets,
+                "full_text_content": full_text,
+                "mtime": payload.get("mtime", 0),
+            }
+        except Exception as e:
+            log_warn(f'  [WARN] 恢复结构树磁盘缓存失败（将重新解析）: {e}')
+
+            return None
+
     def prepare_word_data_async(
-            self, word_path, mode="hierarchical_with_content", progress_callback=None, auto_numbering=False
+            self, word_path, mode="hierarchical_with_content", progress_callback=None,
+            auto_numbering=False, project_name=None
     ):
         """
         异步预处理Word数据，用于提前数据准备
         【NEW】在预处理阶段读取Word全文内容（节点0），供全文匹配阶段使用
         【修改】添加 auto_numbering 参数控制是否使用自动编号
+        【PERF】三级加速：内存缓存 -> 磁盘缓存(tree_cache.json) -> XML直读单遍提取
         """
+        cached_data = None
+        processed_path = word_path
+        is_temp = False
         try:
             cache_key = f"{word_path}:{mode}:{auto_numbering}"
             # 检查缓存
@@ -227,85 +297,154 @@ class HierarchicalMatcher:
                     if file_mtime == cached_mtime:
                         if progress_callback:
                             progress_callback(100, "使用缓存数据")
-                        print(
-                            f"🚀 使用Word缓存数据: {len(self._word_cache[cache_key]['items'])} 项"
-                        )
+                        log_info(f"🚀 使用Word缓存数据: {len(self._word_cache[cache_key]['items'])} 项")
                         return self._word_cache[cache_key]
             if progress_callback:
                 progress_callback(0, "开始预处理Word数据...")
-            # [NEW] 统一打开文档，避免重复打开/转换
-            doc, processed_path, is_temp = self._open_word_doc(word_path)
+
+            # ===== 二级加速：磁盘缓存命中则秒级恢复 =====
+            disk_payload = tree_cache.load_cache(word_path, project_name=project_name)
+            if disk_payload:
+                hydrated = self._hydrate_disk_cache(disk_payload)
+                if hydrated:
+                    self._cache_word_data(cache_key, hydrated)
+                    if progress_callback:
+                        progress_callback(
+                            100,
+                            f"使用结构树缓存：{len(hydrated['items'])} 章节（跳过文档解析）",
+                        )
+                    # [FIX] 命中磁盘缓存原来只打 DEBUG，日志里完全不可见，排查性能问题时一脸懵
+                    log_info(f"🚀 [PERF] 命中结构树磁盘缓存: {len(hydrated['items'])} 章节 + {len(hydrated.get('full_text_content', []))} 项全文内容")
+                    return hydrated
+
+            # ===== 三级加速：XML 直读单遍提取（大文件首选） =====
+            extracted = None
             try:
-                # 提取Word结构
-                word_data = self.extract_word_content(
-                    doc,
-                    mode=mode,
-                    word_path_hint=word_path,
-                    progress_callback=lambda p, msg: (
-                        progress_callback(int(p * 0.4), f"提取结构：{msg}")
-                        if progress_callback
-                        else None
-                    ),
-                    auto_numbering=auto_numbering,
-                )
-                # [FIX] 确保 word_items 是列表
-                if isinstance(word_data, dict) and "all_items" in word_data:
-                    word_items = word_data["all_items"]
-                elif isinstance(word_data, list):
-                    word_items = word_data
-                else:
-                    word_items = []
-                    print(
-                        f"⚠️ extract_word_content 返回了未预期的格式：{type(word_data)}"
-                    )
+                if str(word_path).lower().endswith(".doc"):
+                    processed_path = convert_doc_to_docx(str(word_path))
+                    is_temp = True
                 if progress_callback:
-                    progress_callback(40, "读取全文内容（节点0）...")
-                # 【NEW】读取Word全文内容，用于全文匹配阶段（节点0）
-                # 传入word_items以建立章节-内容映射
-                full_text_content = self._read_word_full_text(doc, word_items)
+                    progress_callback(5, "XML直读提取结构树与全文...")
+
+                def _fast_progress(count):
+                    if progress_callback:
+                        progress_callback(
+                            min(35, 5 + count % 30), f"XML流式解析中... 已处理 {count} 段"
+                        )
+
+                extracted = fast_tree_extractor.extract_doc_tree(
+                    processed_path,
+                    cleaner=self,
+                    auto_numbering=auto_numbering,
+                    include_full_text=True,
+                    progress_cb=_fast_progress,
+                )
+                # [FIX] 空大纲不再静默回退：重试一次并留下告警线索，
+                # 否则大文档会掉进 20+ 分钟的 python-docx 物理遍历
+                if extracted and not extracted[0]:
+                    log_warn('  [WARN] XML直读提取返回空大纲，重试一次...')
+                    extracted = fast_tree_extractor.extract_doc_tree(
+                        processed_path,
+                        cleaner=self,
+                        auto_numbering=auto_numbering,
+                        include_full_text=True,
+                        progress_cb=_fast_progress,
+                    )
+                    if extracted and not extracted[0]:
+                        log_warn('  [WARN] XML直读提取重试后仍为空大纲，回退旧通道')
+            except Exception as e:
+                # [FIX] 打印完整堆栈便于定位解析异常
+                log_warn(f'  [WARN] XML直读提取失败，回退旧通道: {e}')
+
+                import traceback as _tb
+                _tb.print_exc()
+                extracted = None
+
+            if extracted and extracted[0]:
+                outline, full_text_content = extracted
+                hierarchy = self._convert_com_outline_to_hierarchy(
+                    [list(o) for o in outline]
+                )
+                word_items = hierarchy["all_items"]
                 if progress_callback:
                     progress_callback(70, "构建全局索引...")
-                # 构建索引
-                exact_lookup, toc_items, chapter_buckets = self._build_word_index(
-                    word_items, full_text_content
-                )
-                # 缓存结果
-                cached_data = {
-                    "items": word_items,
-                    "exact_lookup": exact_lookup,
-                    "toc_items": toc_items,
-                    "chapter_buckets": chapter_buckets,
-                    "full_text_content": full_text_content,
-                    "mtime": (
-                        os.path.getmtime(word_path) if os.path.exists(word_path) else 0
-                    ),
-                }
-                self._word_cache[cache_key] = cached_data
-                if progress_callback:
-                    progress_callback(
+                cached_data = self._make_cached_word_data(
+                word_items, full_text_content or [], word_path
+            )
+            self._cache_word_data(cache_key, cached_data)
+            tree_cache.save_cache(word_path, cached_data, project_name=project_name)
+            if progress_callback:
+                progress_callback(
                         100, f"预处理完成：{len(word_items)} 章节 + 全文内容已缓存"
                     )
-                print(
-                    f"✅ Word预处理完成：{len(word_items)} 章节 + {len(full_text_content)} 项全文内容已缓存"
+                log_info(f'✅ Word预处理完成(XML直读)：{len(word_items)} 章节 + {len(full_text_content or [])} 项全文内容已缓存')
+                return cached_data
+
+            # ===== 回退：原有 python-docx 通道 =====
+            if progress_callback:
+                progress_callback(0, "回退旧通道预处理Word数据...")
+            # [FIX] .doc 已转换的临时 docx 直接复用，避免二次 COM 转换（并发时易冲突）
+            fallback_input = (
+                processed_path
+                if (is_temp and processed_path and os.path.exists(processed_path))
+                else word_path
+            )
+            doc, processed_path, is_temp = self._open_word_doc(fallback_input)
+            # 提取Word结构
+            word_data = self.extract_word_content(
+                doc,
+                mode=mode,
+                word_path_hint=word_path,
+                progress_callback=lambda p, msg: (
+                    progress_callback(int(p * 0.4), f"提取结构：{msg}")
+                    if progress_callback
+                    else None
+                ),
+                auto_numbering=auto_numbering,
+            )
+            # [FIX] 确保 word_items 是列表
+            if isinstance(word_data, dict) and "all_items" in word_data:
+                word_items = word_data["all_items"]
+            elif isinstance(word_data, list):
+                word_items = word_data
+            else:
+                word_items = []
+                log_warn(f'⚠️ extract_word_content 返回了未预期的格式：{type(word_data)}')
+            if progress_callback:
+                progress_callback(40, "读取全文内容（节点0）...")
+            # 【NEW】读取Word全文内容，用于全文匹配阶段（节点0）
+            # 传入word_items以建立章节-内容映射
+            full_text_content = self._read_word_full_text(doc, word_items)
+            if progress_callback:
+                progress_callback(70, "构建全局索引...")
+            cached_data = self._make_cached_word_data(
+                word_items, full_text_content, word_path
+            )
+            self._word_cache[cache_key] = cached_data
+            tree_cache.save_cache(word_path, cached_data, project_name=project_name)
+            if progress_callback:
+                progress_callback(
+                    100, f"预处理完成：{len(word_items)} 章节 + 全文内容已缓存"
                 )
-                return cached_data
-            finally:
-                # 清理临时文件
-                if is_temp and os.path.exists(processed_path):
-                    try:
-                        os.remove(processed_path)
-                    except:
-                        pass
-                return cached_data
+            log_info(f'✅ Word预处理完成：{len(word_items)} 章节 + {len(full_text_content)} 项全文内容已缓存')
+            return cached_data
         except Exception as e:
-            print(f"️ Word数据预处理失败：{e}")
+            log_error(f'️ Word数据预处理失败：{e}')
             if progress_callback:
                 progress_callback(100, f"预处理失败：{e}")
             return None
+        finally:
+            # 清理临时文件
+            if is_temp and processed_path and os.path.exists(processed_path):
+                try:
+                    os.remove(processed_path)
+                except:
+                    pass
 
-    def _build_word_index(self, word_items, full_text_content=None):
+    def _build_word_index(self, word_items, full_text_content=None, merge_content=True):
         """
         构建Word内容索引（从match_documents中提取）
+        merge_content=False 用于缓存恢复：items 已含合并后的正文，跳过重复合并
         """
         exact_lookup = {}
         toc_items = []
@@ -323,7 +462,7 @@ class HierarchicalMatcher:
                     it["content"] = ""  # 最终合并后的正文
 
         # [NEW] 将 full_text_content 中的正文合并到对应的章节中
-        if full_text_content and word_items:
+        if merge_content and full_text_content and word_items:
             for f_item in full_text_content:
                 if (
                     f_item.get("source") == "paragraph"
@@ -381,21 +520,26 @@ class HierarchicalMatcher:
             if p_num:
                 buckets_to_fill.append(p_num)
 
+            filled_keys = set()
             for bucket_key in buckets_to_fill:
+                if bucket_key in filled_keys:
+                    continue
+                filled_keys.add(bucket_key)
                 if bucket_key not in chapter_buckets:
                     chapter_buckets[bucket_key] = []
-                if item not in chapter_buckets[bucket_key]:
-                    chapter_buckets[bucket_key].append(item)
+                chapter_buckets[bucket_key].append(item)
 
             # 递归分桶 (处理 4.1.1 同时也属于 4.1 和 4 的逻辑)
             if p_num and "." in p_num:
                 parts = p_num.split(".")
                 for i in range(1, len(parts) + 1):
                     parent_key = ".".join(parts[:i])
+                    if parent_key in filled_keys:
+                        continue
+                    filled_keys.add(parent_key)
                     if parent_key not in chapter_buckets:
                         chapter_buckets[parent_key] = []
-                    if item not in chapter_buckets[parent_key]:
-                        chapter_buckets[parent_key].append(item)
+                    chapter_buckets[parent_key].append(item)
 
             # 文本索引
             if t_text and t_text not in exact_lookup:
@@ -760,7 +904,7 @@ class HierarchicalMatcher:
             from docx.text.paragraph import Paragraph
             from docx.table import Table
 
-            print(f"  [INFO] 正在读取 Word 全文文本 (物理流模式)...")
+            log_info(f'  [INFO] 正在读取 Word 全文文本 (物理流模式)...')
             current_num = ""
             heading_ptr = 0
             num_headings = len(headings_queue)
@@ -801,8 +945,7 @@ class HierarchicalMatcher:
                 child_count += 1
                 # 【新增】打印进度
                 if child_count % report_interval == 0:
-                    print(
-                        f"  🚀 [PROGRESS] 全文流解析中... 已处理 {child_count} 个顶层节点 | 段落:{para_processed} 表格:{table_processed} | 当前章节: {current_num}")
+                    log_info(f'  🚀 [PROGRESS] 全文流解析中... 已处理 {child_count} 个顶层节点 | 段落:{para_processed} 表格:{table_processed} | 当前章节: {current_num}')
 
                 if child.tag.endswith("p"):
                     para = Paragraph(child, doc)
@@ -889,12 +1032,11 @@ class HierarchicalMatcher:
                 for i, item in enumerate(full_flow)
                 if "number" in item
             }
-            print(
-                f"  [OK] Word 全文解析完成: 共处理 {child_count} 个节点 (段落={para_processed}, 表格={table_processed})"
-            )
+            log_info(f'  [OK] Word 全文解析完成: 共处理 {child_count} 个节点 (段落={para_processed}, 表格={table_processed})')
             return full_flow
         except Exception as e:
-            print(f"  [WARN] 读取Word全文失败: {e}")
+            log_warn(f'  [WARN] 读取Word全文失败: {e}')
+
             import traceback
             traceback.print_exc()
             return []
@@ -933,7 +1075,8 @@ class HierarchicalMatcher:
                 doc = Document(str(processed_word_file))
             except Exception as e:
                 # 3. 尝试兼容性修复模式 (针对宏等异常格式)
-                print(f"  ⚠️  检测到文档格式异常，尝试兼容模式: {e}")
+                log_warn(f'  ⚠️  检测到文档格式异常，尝试兼容模式: {e}')
+
                 temp_compat_path = None
                 try:
                     with tempfile.NamedTemporaryFile(
@@ -1004,7 +1147,10 @@ class HierarchicalMatcher:
 
                 # 【核心修复】直接传入 doc 对象！而不是传路径！
                 # 这样 extract_word_outline_as_hierarchy 就不会再去重新 Document() 解析一次
-                return self.extract_word_outline_as_hierarchy(doc, auto_numbering=auto_numbering)
+                # 【PERF】同时传 path_hint：对象模式下仍可走 XML 直读快速通道
+                return self.extract_word_outline_as_hierarchy(
+                    doc, auto_numbering=auto_numbering, path_hint=word_path_hint
+                )
 
             # 下面的 flat 和 hierarchical 模式逻辑保持不变
             if mode == "flat":
@@ -1023,7 +1169,6 @@ class HierarchicalMatcher:
                     os.remove(processed_path)
                 except:
                     pass
-
 
     def _get_paragraph_info(self, paragraph, skip_empty=True):
         """提取段落的基础信息：原始文本、清理后文本、样式名等"""
@@ -1220,14 +1365,11 @@ class HierarchicalMatcher:
                     hierarchy["level3"].append(hierarchy_item)
 
             if outline_items:
-                print(
-                    f"  [OK] 从 Document 对象提取完成：共获取 {len(outline_items)} 项"
-                )
+                log_info(f'  [OK] 从 Document 对象提取完成：共获取 {len(outline_items)} 项')
                 return hierarchy
 
         except Exception as e:
-            print(f"  [WARN] 从 Document 对象提取失败: {e}")
-
+            log_warn(f'  [WARN] 从 Document 对象提取失败: {e}')
         return hierarchy
 
     def extract_word_outline_stable(
@@ -1241,7 +1383,7 @@ class HierarchicalMatcher:
         import re
         import time as time_module
 
-        print(f"🚀 [PERF] 开始稳定大纲提取 (python-docx 物理遍历模式)...")
+        log_debug(f'🚀 [PERF] 开始稳定大纲提取 (python-docx 物理遍历模式)...')
         start_scan_time = time_module.time()
 
         result = []
@@ -1308,12 +1450,11 @@ class HierarchicalMatcher:
                 except Exception:
                     continue
 
-            print(
-                f"✅ [PERF] python-docx 遍历完成: 提取 {len(result)} 项, 耗时 {time_module.time() - start_scan_time:.2f}s")
+            log_debug(f'✅ [PERF] python-docx 遍历完成: 提取 {len(result)} 项, 耗时 {time_module.time() - start_scan_time:.2f}s')
             return result
 
         except Exception as e:
-            print(f"❌ python-docx 提取失败: {e}，降级到 COM 模式...")
+            log_error(f'❌ python-docx 提取失败: {e}，降级到 COM 模式...')
             # 降级到原来的 COM 模式
             return self._extract_outline_via_com(doc_path, max_level)
 
@@ -1465,7 +1606,7 @@ class HierarchicalMatcher:
                 continue
 
         if additions:
-            print(f"  [OK] 智能目录补全：识别到 {len(additions)} 个正文式数字标题")
+            log_debug(f'  [OK] 智能目录补全：识别到 {len(additions)} 个正文式数字标题')
             return outline + additions
         return outline
 
@@ -1476,7 +1617,8 @@ class HierarchicalMatcher:
         try:
             doc = Document(doc_path)
         except Exception as exc:
-            print(f"  [WARN] DOCX 标题样式读取失败: {exc}")
+            log_warn(f'  [WARN] DOCX 标题样式读取失败: {exc}')
+
             return []
 
         def style_outline_level(style):
@@ -1527,15 +1669,17 @@ class HierarchicalMatcher:
                 result.append((number, title, display_level))
 
         if result:
-            print(f"  [OK] DOCX 标题语义识别完成：共获取 {len(result)} 项")
+            log_info(f'  [OK] DOCX 标题语义识别完成：共获取 {len(result)} 项')
         return result
 
     def extract_word_outline_as_hierarchy(
-            self, doc_path_or_obj, max_level: int = 9, include_content: bool = False, auto_numbering: bool = False
+            self, doc_path_or_obj, max_level: int = 9, include_content: bool = False, auto_numbering: bool = False, path_hint=None
     ) -> Dict:
         """
         基于物理段落遍历提取层级字典格式（保证顺序 100% 正确）
         【修改】增加大文件降级、对象复用、以及详细的控制台进度打印
+        【PERF】path_hint：传入 Document 对象时若同时给出源文件路径，
+        仍可走 XML 直读快速通道（对象模式本身无法拿到路径）
         """
         from docx import Document
         import re
@@ -1546,29 +1690,71 @@ class HierarchicalMatcher:
         # 【核心修复】判断传入的是路径还是对象
         is_doc_obj = not isinstance(doc_path_or_obj, (str, Path)) and hasattr(doc_path_or_obj, 'paragraphs')
 
+        # 【PERF】XML 直读单遍提取（对大文件提速 1~2 个数量级），失败再走旧通道。
+        # 路径模式用自身路径；对象模式用调用方提供的 path_hint。
+        fast_source = None
         if is_doc_obj:
-            print(f"🚀 [PERF] 复用已加载的 Document 对象进行遍历提取 (避免重复解析大文件)...")
+            log_debug(f'🚀 [PERF] 复用已加载的 Document 对象进行遍历提取 (避免重复解析大文件)...')
             start_time = time_module.time()
             doc = doc_path_or_obj
             doc_path_str = None
+            if path_hint and Path(str(path_hint)).exists() and str(path_hint).lower().endswith(".docx"):
+                fast_source = str(path_hint)
         else:
             doc_path_str = str(doc_path_or_obj)
-            # 【大文件保命策略】如果文件超过 50MB，直接降级到 COM 模式提取
             if Path(doc_path_str).exists():
+                fast_source = doc_path_str
+
+        if fast_source:
+            fast_input = fast_source
+            fast_temp = False
+            try:
+                if fast_input.lower().endswith(".doc"):
+                    fast_input = convert_doc_to_docx(fast_input)
+                    fast_temp = True
+                fast_outline, _ = fast_tree_extractor.extract_doc_tree(
+                    fast_input,
+                    cleaner=self,
+                    auto_numbering=auto_numbering,
+                    max_level=max_level,
+                    include_full_text=False,
+                )
+                if fast_outline:
+                    log_info(f'🚀 [PERF] XML直读提取完成：{len(fast_outline)} 项 (文件 {Path(fast_input).stat().st_size / (1024 * 1024):.1f} MB)')
+                    return self._convert_com_outline_to_hierarchy(
+                        [list(o) for o in fast_outline]
+                    )
+                # [FIX] 快速通道返回空大纲：记录告警（不再静默回退，便于排查）
+                log_warn(f'  [WARN] XML直读提取返回空大纲 (文件 {Path(fast_input).stat().st_size / (1024 * 1024):.1f} MB)，回退旧通道')
+            except Exception as e:
+                log_warn(f'  [WARN] XML直读提取失败，回退旧通道: {e}')
+
+                import traceback as _tb
+                _tb.print_exc()
+            finally:
+                if fast_temp and fast_input != fast_source and Path(fast_input).exists():
+                    try:
+                        os.remove(fast_input)
+                    except:
+                        pass
+
+        if not is_doc_obj:
+            # 【大文件保命策略】如果文件超过 50MB，直接降级到 COM 模式提取
+            if doc_path_str and Path(doc_path_str).exists():
                 file_size_mb = Path(doc_path_str).stat().st_size / (1024 * 1024)
                 if file_size_mb > 50:
-                    print(f"⚠️ [WARNING] 检测到超大文件 ({file_size_mb:.1f} MB)！")
-                    print(f"⚠️ [WARNING] 为避免 python-docx 内存溢出，自动降级到 COM 模式提取大纲...")
+                    log_warn(f'⚠️ [WARNING] 检测到超大文件 ({file_size_mb:.1f} MB)！')
+                    log_warn(f'⚠️ [WARNING] 为避免 python-docx 内存溢出，自动降级到 COM 模式提取大纲...')
                     com_outline = self._extract_outline_via_com(doc_path_str, max_level)
                     return self._convert_com_outline_to_hierarchy(com_outline)
 
-            print(f"🚀 [PERF] 开始物理段落遍历提取 (自动编号：{'开启' if auto_numbering else '关闭'})...")
+            log_debug(f"🚀 [PERF] 开始物理段落遍历提取 (自动编号：{('开启' if auto_numbering else '关闭')})...")
             start_time = time_module.time()
             doc = Document(doc_path_str)
 
         try:
             # 预构建样式名 -> outline level 的映射表
-            print(f"  [INFO] 正在解析文档样式表...")
+            log_info(f'  [INFO] 正在解析文档样式表...')
             style_to_level = {}
             for style in doc.styles:
                 try:
@@ -1595,9 +1781,9 @@ class HierarchicalMatcher:
             auto_counters = [0] * 10  # 自动编号计数器
 
             # ================= 【新增】进度打印准备 =================
-            print(f"  [INFO] 正在统计文档总段落数 (大文件可能需要几秒)...")
+            log_info(f'  [INFO] 正在统计文档总段落数 (大文件可能需要几秒)...')
             total_paras = len(doc.paragraphs)
-            print(f"  [INFO] 文档总段落数: {total_paras}，开始物理遍历提取大纲...")
+            log_info(f'  [INFO] 文档总段落数: {total_paras}，开始物理遍历提取大纲...')
             # 每处理 2000 个段落或 5% 打印一次进度（取较大值，避免刷屏）
             report_interval = max(2000, int(total_paras * 0.05))
             para_count = 0
@@ -1609,8 +1795,7 @@ class HierarchicalMatcher:
                 # 【新增】打印进度
                 if para_count % report_interval == 0:
                     percent = (para_count / total_paras) * 100
-                    print(
-                        f"  🚀 [PROGRESS] 大纲遍历中... {para_count}/{total_paras} ({percent:.1f}%) | 已提取 {len(outline)} 个标题")
+                    log_info(f'  🚀 [PROGRESS] 大纲遍历中... {para_count}/{total_paras} ({percent:.1f}%) | 已提取 {len(outline)} 个标题')
 
                 try:
                     text = para.text
@@ -1686,10 +1871,10 @@ class HierarchicalMatcher:
             outline = [(n, t, lv) for n, t, lv in outline if not _is_body_paragraph(t)]
             filtered = before_filter - len(outline)
             if filtered:
-                print(f"  [OK] 已过滤 {filtered} 个误标大纲级别的正文段落")
+                log_info(f'  [OK] 已过滤 {filtered} 个误标大纲级别的正文段落')
 
             if not outline:
-                print("  [!] 警告：未从大纲提取到任何项")
+                log_warn('  [!] 警告：未从大纲提取到任何项')
                 return hierarchy
 
             # 构建层级字典
@@ -1725,19 +1910,19 @@ class HierarchicalMatcher:
                     hierarchy["level3"].append(item)
 
             elapsed = time_module.time() - start_time
-            print(f"✅ [PERF] 物理遍历完成：提取 {len(outline)} 项，耗时 {elapsed:.2f}s")
+            log_debug(f'✅ [PERF] 物理遍历完成：提取 {len(outline)} 项，耗时 {elapsed:.2f}s')
 
             if include_content:
-                print(f"  [INFO] 正在提取正文内容以补全结构...")
+                log_info(f'  [INFO] 正在提取正文内容以补全结构...')
                 target_for_full_text = doc_path_str if doc_path_str else doc
                 full_text = self._read_word_full_text(target_for_full_text, hierarchy["all_items"])
                 self._build_word_index(hierarchy["all_items"], full_text)
-                print(f"  [OK] 正文内容集成完成")
+                log_info(f'  [OK] 正文内容集成完成')
 
             return hierarchy
 
         except Exception as e:
-            print(f"  [ERROR] 物理遍历提取失败：{e}")
+            log_error(f'  [ERROR] 物理遍历提取失败：{e}')
             import traceback
             traceback.print_exc()
             return hierarchy
@@ -1784,8 +1969,41 @@ class HierarchicalMatcher:
             elif level >= 3:
                 hierarchy["level3"].append(item)
 
-        print(f"✅ [PERF] COM 降级提取完成：共转换 {len(outline)} 项为层级字典")
+        log_debug(f'✅ [PERF] COM 降级提取完成：共转换 {len(outline)} 项为层级字典')
         return hierarchy
+
+    def hierarchy_from_tree_txt(self, tree_txt_path):
+        """
+        从已导出的 Word结构树.txt 反解析层级结构（用户手动导入目录树的入口）。
+        返回与 extract_word_outline_as_hierarchy 同构的 hierarchy 字典。
+        """
+        outline = fast_tree_extractor.parse_tree_txt(tree_txt_path)
+        if not outline:
+            raise ValueError(f"目录树txt中未解析到任何条目: {tree_txt_path}")
+        log_debug(f'✅ [PERF] 目录树txt导入：解析 {len(outline)} 项')
+        return self._convert_com_outline_to_hierarchy([list(o) for o in outline])
+
+    def build_cache_from_tree_txt(
+            self, tree_txt_path, word_path, auto_numbering=False, project_name=None
+    ):
+        """
+        从目录树txt构建完整预处理缓存（层级树 + 全文流 + 索引），
+        并持久化为磁盘缓存，后续第0步/Step5/Step6 全部复用。
+        """
+        cache_key = f"{word_path}:hierarchical_with_content:{auto_numbering}"
+        hierarchy = self.hierarchy_from_tree_txt(tree_txt_path)
+        word_items = hierarchy["all_items"]
+        log_info(f'  [INFO] 正在基于导入目录树读取 Word 全文内容...')
+        full_text_content = fast_tree_extractor.extract_full_text_flow(
+            word_path, word_items, cleaner=self
+        )
+        cached_data = self._make_cached_word_data(
+            word_items, full_text_content or [], word_path
+        )
+        self._cache_word_data(cache_key, cached_data)
+        tree_cache.save_cache(word_path, cached_data, project_name=project_name)
+        log_info(f'✅ 目录树txt预处理完成：{len(word_items)} 章节 + {len(full_text_content or [])} 项全文内容')
+        return cached_data
 
     def _extract_word_flat(
         self, doc, progress_callback=None, full_text_search: bool = False
@@ -1897,17 +2115,18 @@ class HierarchicalMatcher:
         # 【优先路径】优先使用稳定大纲提取方法（基于 Word COM 接口的 OutlineLevel）
         if word_file:
             try:
-                print("  [INFO] 优先使用稳定大纲提取引擎 (基于 OutlineLevel)...")
+                log_info('  [INFO] 优先使用稳定大纲提取引擎 (基于 OutlineLevel)...')
                 return self.extract_word_outline_as_hierarchy(word_file)
             except Exception as e:
-                print(f"  [WARN] 稳定提取失败: {e}")
-                print(f"  [INFO] 降级使用 DocumentProcessor 备用方案...")
+                log_warn(f'  [WARN] 稳定提取失败: {e}')
+
+                log_error(f'  [INFO] 降级使用 DocumentProcessor 备用方案...')
 
         # 【备用路径】如果稳定提取失败或未提供 word_file，则使用 DocumentProcessor
         # 优先使用已打开的 doc 对象，如果没有则尝试 word_file 路径
         target_to_extract = doc if doc is not None else word_file
         if not target_to_extract:
-            print("  [!] 警告: 未提供文档对象或路径，无法使用任何提取引擎")
+            log_warn('  [!] 警告: 未提供文档对象或路径，无法使用任何提取引擎')
             return hierarchy
 
         try:
@@ -1916,7 +2135,7 @@ class HierarchicalMatcher:
             # 使用 DocumentProcessor 作为备用方案
             sections = DocumentProcessor.extract_word_structure(target_to_extract)
             if not sections:
-                print("  [!] 警告: 智能提取引擎未返回任何章节信息")
+                log_warn('  [!] 警告: 智能提取引擎未返回任何章节信息')
                 return hierarchy
 
             item_count = 0
@@ -1972,13 +2191,11 @@ class HierarchicalMatcher:
                     hierarchy["level3"].append(item)
                     item_count += 1
 
-            print(
-                f"  [OK] 智能提取引擎完成：成功获取 {item_count} 个结构项 (对接 Smart Directory)"
-            )
+            log_info(f'  [OK] 智能提取引擎完成：成功获取 {item_count} 个结构项 (对接 Smart Directory)')
             return hierarchy
 
         except Exception as e:
-            print(f"  [ERROR] 智能提取引擎执行异常: {e}")
+            log_error(f'  [ERROR] 智能提取引擎执行异常: {e}')
             import traceback
 
             traceback.print_exc()
@@ -2242,7 +2459,6 @@ class HierarchicalMatcher:
 
         return data
 
-
     def _load_excel_with_merged(self, excel_file_or_df, sheet_name=0, header=0):
         """
         加载 Excel 并处理合并单元格
@@ -2417,6 +2633,30 @@ class HierarchicalMatcher:
 
         return cleaned_text
 
+    # [PERF] 标题清理配置缓存：basic_clean/clean_title_suffix 在大文档解析中
+    # 会被每个段落调用一次，不能每次都解析 matcher_config.json；
+    # 以配置文件 mtime 做失效判断，设置页修改后仍能实时生效
+    _title_cleanup_cfg_cache = None  # (mtime, config)
+
+    def _get_title_cleanup_config(self):
+        cls = type(self)
+        try:
+            from extend.matcher_config import MatcherConfig
+            cfg_path = MatcherConfig.CONFIG_FILE
+            mtime = os.path.getmtime(cfg_path) if cfg_path and os.path.exists(cfg_path) else 0
+        except Exception:
+            cfg_path, mtime = None, 0
+        cached = cls._title_cleanup_cfg_cache
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        try:
+            from extend.matcher_config import MatcherConfig
+            cleanup_config = MatcherConfig.load().get("title_cleanup", {})
+        except Exception:
+            cleanup_config = {}
+        cls._title_cleanup_cfg_cache = (mtime, cleanup_config)
+        return cleanup_config
+
     def clean_title_suffix(self, text: str) -> str:
         """
         根据配置清理标题中的无意义后缀（如“（一级功能模块）”）
@@ -2425,12 +2665,7 @@ class HierarchicalMatcher:
             return ""
         cleaned_text = text.strip()
 
-        # 读取配置
-        try:
-            from extend.matcher_config import MatcherConfig
-            cleanup_config = MatcherConfig.load().get("title_cleanup", {})
-        except:
-            cleanup_config = {}
+        cleanup_config = self._get_title_cleanup_config()
 
         suffix_keywords = cleanup_config.get("suffix_keywords", [
             "一级功能模块", "二级功能模块", "三级功能模块"
@@ -2464,7 +2699,6 @@ class HierarchicalMatcher:
         # 清理多余的空格
         cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
         return cleaned_text
-
 
     def basic_clean(self, text: str) -> str:
         """
@@ -2523,8 +2757,6 @@ class HierarchicalMatcher:
         cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
 
         return cleaned_text
-
-
 
     def split_long_paragraph_into_items(self, long_text: str) -> List[str]:
         """
@@ -2591,19 +2823,17 @@ class HierarchicalMatcher:
             buckets_ok = preloaded_data.get("chapter_buckets") is not None
             full_text_ok = preloaded_data.get("full_text_content") is not None
 
-            print(f"[DEBUG] 预处理数据完整性检查:")
-            print(f"  - items: {items_ok} ({len(preloaded_data.get('items', []))} 项)")
-            print(f"  - exact_lookup: {lookup_ok}")
-            print(f"  - toc_items: {toc_ok}")
-            print(f"  - chapter_buckets: {buckets_ok}")
-            print(
-                f"  - full_text_content: {full_text_ok} ({len(preloaded_data.get('full_text_content', []))} 项)"
-            )
+            log_debug(f'[DEBUG] 预处理数据完整性检查:')
+            log_info(f"  - items: {items_ok} ({len(preloaded_data.get('items', []))} 项)")
+            log_info(f'  - exact_lookup: {lookup_ok}')
+            log_info(f'  - toc_items: {toc_ok}')
+            log_info(f'  - chapter_buckets: {buckets_ok}')
+            log_info(f"  - full_text_content: {full_text_ok} ({len(preloaded_data.get('full_text_content', []))} 项)")
 
             # [CRITICAL FIX] 如果全文内容为空，功能过程匹配将无法进行，必须兜底提取
             if full_text_ok and len(preloaded_data.get("full_text_content", [])) == 0:
-                print(f"\n[CRITICAL] 检测到正文内容为空！")
-                print(f"  Word文件路径: {word_file}")
+                log_info(f'\n[CRITICAL] 检测到正文内容为空！')
+                log_info(f'  Word文件路径: {word_file}')
                 try:
                     # 传入word_items以建立章节-内容映射
                     full_text = self._read_word_full_text(
@@ -2626,20 +2856,14 @@ class HierarchicalMatcher:
                         else:
                             preloaded_data["exact_lookup"] = additional_lookup
 
-                        print(
-                            f"  [SUCCESS] 补救成功: 提取到 {len(full_text)} 项正文内容，已更新索引"
-                        )
+                        log_info(f'  [SUCCESS] 补救成功: 提取到 {len(full_text)} 项正文内容，已更新索引')
                         # 打印前5项作为验证
                         for i, item in enumerate(full_text[:3]):
-                            print(
-                                f"    - Sample {i+1}: {item.get('original', '')[:50]}... (Parent: {item.get('parent_num')})"
-                            )
+                            log_info(f"    - Sample {i + 1}: {item.get('original', '')[:50]}... (Parent: {item.get('parent_num')})")
                     else:
-                        print(
-                            "  [ERROR] 补救失败: 无法从文档中提取到有效正文。请检查文件是否被加密或损坏。"
-                        )
+                        log_error('  [ERROR] 补救失败: 无法从文档中提取到有效正文。请检查文件是否被加密或损坏。')
                 except Exception as e:
-                    print(f"  [ERROR] 补救过程抛出异常: {e}")
+                    log_error(f'  [ERROR] 补救过程抛出异常: {e}')
                     traceback.print_exc()
 
             if all(
@@ -2651,7 +2875,7 @@ class HierarchicalMatcher:
                     preloaded_data.get("full_text_content") is not None,
                 ]
             ):
-                print("🚀 [匹配] 使用完整的预处理数据和新的分层递归匹配...")
+                log_info('🚀 [匹配] 使用完整的预处理数据和新的分层递归匹配...')
                 if progress_callback:
                     progress_callback(0, "开始分层递归匹配...")
 
@@ -2685,7 +2909,7 @@ class HierarchicalMatcher:
                             excel_data.append(item)
                             seen_keys.add(key)
 
-                    print(f"✓ Excel数据: {len(excel_data)} 项")
+                    log_info(f'✓ Excel数据: {len(excel_data)} 项')
 
                     # 使用新的分层递归匹配
                     report = self._match_hierarchical_layered(
@@ -2704,13 +2928,14 @@ class HierarchicalMatcher:
                     return report
 
                 except Exception as e:
-                    print(f"⚠️ 分层递归匹配失败: {e}")
+                    log_warn(f'⚠️ 分层递归匹配失败: {e}')
+
                     traceback.print_exc()
                     # 降级到旧的匹配方法
-                    print("降级到兼容匹配方法...")
+                    log_error('降级到兼容匹配方法...')
 
         # 以下是原有的处理流程（当没有完整预处理数据时）
-        print("⚠️ 预处理数据不完整，使用标准流程进行提取和匹配")
+        log_warn('⚠️ 预处理数据不完整，使用标准流程进行提取和匹配')
         if word_items_preloaded is not None:
             # 如果开启全文搜索但预加载数据缺少正文，则回退到全文提取
             if full_text_search:
@@ -2820,22 +3045,22 @@ class HierarchicalMatcher:
                 seen_keys.add(key)
 
         if not word_items:
-            print("错误：Word 文档中没有找到内容")
+            log_error('错误：Word 文档中没有找到内容')
             return None
 
         if not excel_data:
-            print("错误：Excel 文件中没有找到数据")
+            log_error('错误：Excel 文件中没有找到数据')
             return None
 
-        print(f"\n正在执行简单匹配...")
-        print(f"Word 内容项: {len(word_items)} 个")
-        print(f"Excel 功能点: {len(excel_data)} 个")
+        log_info(f'\n正在执行简单匹配...')
+        log_info(f'Word 内容项: {len(word_items)} 个')
+        log_info(f'Excel 功能点: {len(excel_data)} 个')
 
         if progress_callback:
             progress_callback(30, f"开始匹配 ({len(excel_data)} 项)...")
 
         # --- 性能优化：顺序启发式匹配 + 目录优先 + 延迟并发匹配 ---
-        print(f"正在预处理 Word 内容并构建索引...")
+        log_info(f'正在预处理 Word 内容并构建索引...')
         exact_lookup = {}  # 用于 O(1) 的精确匹配
         toc_items = []  # 目录/标题项
         toc_index = []  # [NEW] 目录编号索引，用于递归章节范围定位
@@ -2970,7 +3195,7 @@ class HierarchicalMatcher:
                     match_rate = (
                         (matched_count_phase1 / (idx + 1) * 100) if idx > 0 else 0
                     )
-                    print(f"  {msg} - 当前匹配率: {match_rate:.1f}%")
+                    log_info(f'  {msg} - 当前匹配率: {match_rate:.1f}%')
                     last_progress_time = current_time
 
             excel_original = excel_item["original"]
@@ -2983,9 +3208,7 @@ class HierarchicalMatcher:
 
             # 【NEW】详细日志（仅在前50项或启用 DETAILED_LOG）
             if DETAILED_LOG and idx < 50:
-                print(
-                    f"[PHASE1-DEBUG] 处理第 {idx+1} 项: {excel_original[:30]}... (L3: {excel_level3[:15]}...)"
-                )
+                log_info(f'[PHASE1-DEBUG] 处理第 {idx + 1} 项: {excel_original[:30]}... (L3: {excel_level3[:15]}...)')
 
             # --- 1. 【性能优化】多级匹配：优先完全匹配，然后高质量模糊匹配 ---
 
@@ -3181,13 +3404,9 @@ class HierarchicalMatcher:
                 if (
                     DETAILED_LOG and bucket_search_count > 500
                 ):  # 【NEW】当搜索次数过多时记录
-                    print(
-                        f"  ⚠️ 章节范围搜索需要遍历 {bucket_search_count} 个 bucket（{len(chapter_buckets)} 总数）"
-                    )
+                    log_warn(f'  ⚠️ 章节范围搜索需要遍历 {bucket_search_count} 个 bucket（{len(chapter_buckets)} 总数）')
 
-                print(
-                    f"  章节范围搜索: {l_target_num} -> {next_section_num}, 候选项: {len(chapter_candidates)}"
-                )
+                log_info(f'  章节范围搜索: {l_target_num} -> {next_section_num}, 候选项: {len(chapter_candidates)}')
             else:
                 # 回退到通用的分桶检索
                 l_target_clean = (
@@ -3214,7 +3433,7 @@ class HierarchicalMatcher:
                         exact_matched.append(match_data)
                         last_found_idx = cand["_global_idx"]
                         found_in_current_stage = True
-                        print(f"    ✓ 章节内精确匹配: {excel_text[:20]}...")
+                        log_info(f'    ✓ 章节内精确匹配: {excel_text[:20]}...')
                         break
 
                 if found_in_current_stage:
@@ -3243,19 +3462,15 @@ class HierarchicalMatcher:
                     last_found_idx = ch_match["_global_idx"]
                     found_in_current_stage = True
                     if DETAILED_LOG and idx < 50:  # 【NEW】仅前 50 项显示详细日志
-                        print(
-                            f"    ≈ 章节内模糊匹配: {excel_text[:20]}... (score: {ch_score:.2f})"
-                        )
+                        log_info(f'    ≈ 章节内模糊匹配: {excel_text[:20]}... (score: {ch_score:.2f})')
                     else:
-                        print(
-                            f"    ≈ 章节内模糊匹配: {excel_text[:20]}... (score: {ch_score:.2f})"
-                        )
+                        log_info(f'    ≈ 章节内模糊匹配: {excel_text[:20]}... (score: {ch_score:.2f})')
                     # 【NEW】更新第一阶段匹配计数
                     matched_count_phase1 += 1
                     continue
                 else:
                     if DETAILED_LOG and idx < 50:  # 【NEW】仅前 50 项显示详细日志
-                        print(f"    ✗ 章节内未找到匹配: {excel_text[:20]}...")
+                        log_error(f'    ✗ 章节内未找到匹配: {excel_text[:20]}...')
 
             # --- 4. 第一阶段未匹配，记为延期，进入全文搜索 ---
             if not found_in_current_stage:
@@ -3265,12 +3480,10 @@ class HierarchicalMatcher:
         if deferred_items:
             # 【NEW】第一阶段统计信息
             phase1_elapsed = time_module.time() - phase1_start_time
-            print(
-                f"\n[STATS] 第一阶段耗时: {phase1_elapsed:.2f}s, 已匹配: {matched_count_phase1}/{total} 项"
-            )
+            log_info(f'\n[STATS] 第一阶段耗时: {phase1_elapsed:.2f}s, 已匹配: {matched_count_phase1}/{total} 项')
 
             deferred_total = len(deferred_items)
-            print(f"\n第一阶段章节搜索未匹配 {deferred_total} 项，开始全文搜索...")
+            log_info(f'\n第一阶段章节搜索未匹配 {deferred_total} 项，开始全文搜索...')
             phase2_start_time = time_module.time()  # 【NEW】记录第二阶段开始时间
             if progress_callback:
                 progress_callback(
@@ -3485,7 +3698,7 @@ class HierarchicalMatcher:
                                 }
                             )
                 except Exception as e:
-                    print(f"Error in process_deferred_item: {e}")
+                    log_error(f'Error in process_deferred_item: {e}')
 
             # 并发执行深度搜索
             max_workers = 4  # 略微增加并发
@@ -3510,7 +3723,7 @@ class HierarchicalMatcher:
                             progress_callback(p, msg)
                         # 同时打印到 stdout 以便 RuntimeLogger 实时记录
                         if comp % 20 == 0 or comp == deferred_total:
-                            print(f"  {msg}")
+                            log_info(f'  {msg}')
 
         if progress_callback:
             progress_callback(90, "正在汇总报告...")
@@ -3518,9 +3731,7 @@ class HierarchicalMatcher:
         # 【NEW】第二阶段统计信息
         if deferred_items:
             phase2_elapsed = time_module.time() - phase2_start_time
-            print(
-                f"\n[STATS] 第二阶段耗时: {phase2_elapsed:.2f}s, 处理项数: {len(deferred_items)}"
-            )
+            log_info(f'\n[STATS] 第二阶段耗时: {phase2_elapsed:.2f}s, 处理项数: {len(deferred_items)}')
 
         total_excel = len(excel_data)
         exact_count = len(exact_matched)
@@ -3529,9 +3740,7 @@ class HierarchicalMatcher:
         missing_count = len(not_found_in_word)
         match_rate = (matched_count / total_excel * 100) if total_excel > 0 else 0
 
-        print(
-            f"\n分层匹配完成：精确 {exact_count} 项，模糊 {fuzzy_count} 项，缺失 {missing_count} 项"
-        )
+        log_info(f'\n分层匹配完成：精确 {exact_count} 项，模糊 {fuzzy_count} 项，缺失 {missing_count} 项')
         if full_text_search:
             # 统计分层匹配的详细位置
             chapter_exact_count = sum(
@@ -3544,9 +3753,7 @@ class HierarchicalMatcher:
                 for item in exact_matched + fuzzy_matched
                 if "全局" in item.get("位置", "") or "核心章节" in item.get("位置", "")
             )
-            print(
-                f"  其中：章节范围匹配 {chapter_exact_count} 项，全文搜索匹配 {global_count} 项"
-            )
+            log_info(f'  其中：章节范围匹配 {chapter_exact_count} 项，全文搜索匹配 {global_count} 项')
 
         # 移除过多的终端打印，保持界面干净
         if progress_callback:
@@ -3879,13 +4086,13 @@ class HierarchicalMatcher:
                 f"\n[HIERARCHICAL MATCHING] Processing {total} functional points..."
             )
         else:
-            print(f"\n[HIERARCHICAL MATCHING] Processing {total} functional points...")
+            log_debug(f'\n[HIERARCHICAL MATCHING] Processing {total} functional points...')
 
         # ============ 阶段1：章节完全匹配 ============
         if DETAILED_LOG:
             RuntimeLogger.log(f"\n[STAGE 1] Exact chapter matching...")
         else:
-            print(f"\n[STAGE 1] Exact chapter matching...")
+            log_debug(f'\n[STAGE 1] Exact chapter matching...')
         phase1_start = time_module.time()
 
         for idx, excel_item in enumerate(excel_data):
@@ -4010,21 +4217,21 @@ class HierarchicalMatcher:
         if DETAILED_LOG:
             RuntimeLogger.log(log_msg)
         else:
-            print(log_msg)
+            log_debug(log_msg)
 
         # ============ 阶段2：章节内容递归搜索 ============
         log_msg = f"\n[STAGE 2] Chapter content recursive search ({len(unfound_chapter_match)} items)..."
         if DETAILED_LOG:
             RuntimeLogger.log(log_msg)
         else:
-            print(log_msg)
+            log_debug(log_msg)
 
         # 【DEBUG】打印chapter_buckets的示例
         if DETAILED_LOG and chapter_buckets:
             sample_keys = list(chapter_buckets.keys())[:10]
-            print(f"  [DEBUG] Sample chapter_buckets keys: {sample_keys}")
+            log_debug(f'  [DEBUG] Sample chapter_buckets keys: {sample_keys}')
             for key in sample_keys:
-                print(f"    {key}: {len(chapter_buckets[key])} items")
+                log_info(f'    {key}: {len(chapter_buckets[key])} items')
 
         phase2_start = time_module.time()
 
@@ -4048,9 +4255,7 @@ class HierarchicalMatcher:
             )
 
             if DETAILED_LOG and idx < 10:
-                print(
-                    f"  [DEBUG] P2-Item: '{excel_original[:30]}...' (Parent: {excel_parent_num})"
-                )
+                log_debug(f"  [DEBUG] P2-Item: '{excel_original[:30]}...' (Parent: {excel_parent_num})")
 
             # 【NEW】尝试从 hierarchy_mapping 中获取已匹配的章节编号
             mapped_num = None
@@ -4119,7 +4324,7 @@ class HierarchicalMatcher:
                 if DETAILED_LOG:
                     RuntimeLogger.log(log_msg)
                 else:
-                    print(log_msg)
+                    log_debug(log_msg)
 
             # 如果有章节编号，进行递归搜索
             if extracted_num:
@@ -4129,7 +4334,7 @@ class HierarchicalMatcher:
                     if DETAILED_LOG:
                         RuntimeLogger.log(log_msg)
                     else:
-                        print(log_msg)
+                        log_debug(log_msg)
 
                 found_recursive, match_item, score, location = (
                     self._recursive_chapter_search(
@@ -4149,7 +4354,7 @@ class HierarchicalMatcher:
                     if DETAILED_LOG:
                         RuntimeLogger.log(log_msg)
                     else:
-                        print(log_msg)
+                        log_debug(log_msg)
 
                 if found_recursive:
                     match_data = {
@@ -4174,15 +4379,11 @@ class HierarchicalMatcher:
                 else:
                     # 【NEW】DEBUG：未找到的原因
                     if DETAILED_LOG and idx < 10:
-                        print(
-                            f"    ✗ 递归搜索失败: '{excel_original[:30]}...' in range [{extracted_num}, ...)"
-                        )
+                        log_error(f"    ✗ 递归搜索失败: '{excel_original[:30]}...' in range [{extracted_num}, ...)")
             else:
                 # 【NEW】DEBUG：无法提取编号
                 if DETAILED_LOG and idx < 10:
-                    print(
-                        f"    ✗ 无法提取编号: level3='{excel_item.get('level3', '')}', parent_num='{excel_parent_num}'"
-                    )
+                    log_error(f"    ✗ 无法提取编号: level3='{excel_item.get('level3', '')}', parent_num='{excel_parent_num}'")
 
             if not found:
                 still_unfound.append(excel_item)
@@ -4195,14 +4396,14 @@ class HierarchicalMatcher:
         if DETAILED_LOG:
             RuntimeLogger.log(log_msg)
         else:
-            print(log_msg)
+            log_debug(log_msg)
 
         # ============ 阶段3：全文匹配 ============
         log_msg = f"\n[STAGE 3] Full-text matching ({len(still_unfound)} items)..."
         if DETAILED_LOG:
             RuntimeLogger.log(log_msg)
         else:
-            print(log_msg)
+            log_debug(log_msg)
         phase3_start = time_module.time()
 
         not_found_in_word = []
@@ -4287,7 +4488,7 @@ class HierarchicalMatcher:
         if DETAILED_LOG:
             RuntimeLogger.log(log_msg)
         else:
-            print(log_msg)
+            log_debug(log_msg)
 
         # 返回结果
         total_matched = len(exact_matched) + len(fuzzy_matched)
@@ -4404,12 +4605,36 @@ class HierarchicalMatcher:
             chapter_range_candidates = []
             current_prefix = excel_parent_num + "."
 
+            # [PERF] 前缀桶索引：一次构建，O(1) 取子树桶，替代每候选全键 startswith 扫描
+            bucket_prefix_cache = getattr(self, "_bucket_prefix_cache", None)
+            if not bucket_prefix_cache or bucket_prefix_cache[0] != id(chapter_buckets):
+                pb = {}
+                non_numeric_keys = set()
+                for k in chapter_buckets:
+                    k_norm = str(k).strip().rstrip(".")
+                    parts = [p for p in k_norm.split(".") if p.isdigit()]
+                    if ".".join(parts) == k_norm and parts:
+                        for i in range(1, len(parts) + 1):
+                            pb.setdefault(".".join(parts[:i]), []).append(k)
+                    else:
+                        non_numeric_keys.add(k)
+                bucket_prefix_cache = (id(chapter_buckets), pb, non_numeric_keys)
+                self._bucket_prefix_cache = bucket_prefix_cache
+            prefix_map = bucket_prefix_cache[1]
+            non_numeric_keys = bucket_prefix_cache[2]
+
             if excel_parent_num in chapter_buckets:
                 chapter_range_candidates.extend(chapter_buckets[excel_parent_num])
 
-            for bucket_key in chapter_buckets:
-                if bucket_key.startswith(current_prefix):
+            for bucket_key in prefix_map.get(excel_parent_num, []):
+                if bucket_key != excel_parent_num:
                     chapter_range_candidates.extend(chapter_buckets[bucket_key])
+
+            # 保留对非数字桶键的兼容（旧行为：startswith 前缀扫描；数字键已由前缀索引覆盖）
+            if non_numeric_keys:
+                for bucket_key in non_numeric_keys:
+                    if str(bucket_key).startswith(current_prefix):
+                        chapter_range_candidates.extend(chapter_buckets[bucket_key])
 
             seen = set()
             chapter_range_candidates = [
@@ -4465,7 +4690,14 @@ class HierarchicalMatcher:
             c_text = candidate.get("text", candidate.get("original", ""))
             if not c_text:
                 continue
-            c_clean = self.basic_clean(c_text)
+            # [PERF] basic_clean 结果缓存在候选对象上，避免同一候选重复清洗
+            c_clean = candidate.get("_rcs_clean")
+            if c_clean is None:
+                c_clean = self.basic_clean(c_text)
+                try:
+                    candidate["_rcs_clean"] = c_clean
+                except TypeError:
+                    pass
 
             # 【保留】100% 精确命中，立即返回
             if excel_text_clean == c_clean:
@@ -4479,7 +4711,13 @@ class HierarchicalMatcher:
             # --- 智能特征增强 ---
             if score < 0.90:
                 words_excel = set(re.findall(r"\w+", excel_text_clean))
-                words_word = set(re.findall(r"\w+", c_clean))
+                words_word = candidate.get("_rcs_words")
+                if words_word is None:
+                    words_word = set(re.findall(r"\w+", c_clean))
+                    try:
+                        candidate["_rcs_words"] = words_word
+                    except TypeError:
+                        pass
                 if words_excel and words_word:
                     intersection = words_excel & words_word
                     overlap_ratio = len(intersection) / len(words_excel)
@@ -4556,9 +4794,7 @@ class HierarchicalMatcher:
         # 兜底方案：如果流式搜索未命中或不可用，退回到原来的基于编号遍历的逻辑
         if not chapter_range_candidates:
             if DETAILED_LOG:
-                print(
-                    f"    [DEBUG-RCS] Falling back to range-based search for {excel_parent_num}"
-                )
+                log_info(f'    [DEBUG-RCS] Falling back to range-based search for {excel_parent_num}')
 
             # 1. 从 Word 项目（通常是标题）中筛选
             for item in word_items or []:
@@ -4607,17 +4843,11 @@ class HierarchicalMatcher:
                 if num:
                     range_chapters.add(num)
 
-            print(
-                f"    Range[{excel_parent_num}, {next_sibling}): "
-                f"items={bucket_count}, content={content_count}, skipped={content_skipped}, "
-                f"total={len(chapter_range_candidates)}, chapters={sorted(range_chapters) if range_chapters else 'NONE'}"
-            )
+            log_info(f"    Range[{excel_parent_num}, {next_sibling}): items={bucket_count}, content={content_count}, skipped={content_skipped}, total={len(chapter_range_candidates)}, chapters={(sorted(range_chapters) if range_chapters else 'NONE')}")
 
             # 【DEBUG】如果full_text_content存在但content_count为0，输出第一个跳过项的详情
             if full_text_content and content_count == 0 and content_skipped > 0:
-                print(
-                    f"      [DEBUG] full_text_content has {len(full_text_content)} items, but all skipped!"
-                )
+                log_debug(f'      [DEBUG] full_text_content has {len(full_text_content)} items, but all skipped!')
                 # 输出前3个跳过项的详细信息
                 checked = 0
                 for full_item in full_text_content[:50]:  # 检查前50项
@@ -4634,9 +4864,7 @@ class HierarchicalMatcher:
                                 full_item.get("text", "")
                                 or full_item.get("original", "")
                             )[:30]
-                            print(
-                                f"        Sample #{checked+1}: text='{sample_text}...' | num={item_num} | in_range=False"
-                            )
+                            log_info(f"        Sample #{checked + 1}: text='{sample_text}...' | num={item_num} | in_range=False")
                             checked += 1
                     # 显示前3个没有编号的样本
                     elif not item_num:
@@ -4645,9 +4873,7 @@ class HierarchicalMatcher:
                                 full_item.get("text", "")
                                 or full_item.get("original", "")
                             )[:30]
-                            print(
-                                f"        Sample #{checked+1}: text='{sample_text}...' | num=NONE | reason=NO_NUMBER"
-                            )
+                            log_info(f"        Sample #{checked + 1}: text='{sample_text}...' | num=NONE | reason=NO_NUMBER")
                             checked += 1
 
                     if checked >= 6:  # 最多显示6个样本
@@ -5033,7 +5259,7 @@ class HierarchicalMatcher:
 
         while attempt < max_attempts:
             try:
-                print(f"\n正在生成报告文件: {output_file}")
+                log_debug(f'\n正在生成报告文件: {output_file}')
                 with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
                     # 统计概览
                     stats_df = pd.DataFrame([report["statistics"]])
@@ -5092,9 +5318,7 @@ class HierarchicalMatcher:
                         if "层级不匹配" in str(report.get("statistics", {})):
                             is_node5_report = True
 
-                    print(
-                        f"  报告类型判断: {'层级匹配报告' if is_node5_report else '简单匹配报告'}"
-                    )
+                    log_debug(f"  报告类型判断: {('层级匹配报告' if is_node5_report else '简单匹配报告')}")
 
                     current_column_order = (
                         hierarchical_column_order
@@ -5177,9 +5401,8 @@ class HierarchicalMatcher:
                         problem_df.to_excel(
                             writer, sheet_name="❌ 缺失和⚠️ 层级不匹配", index=False
                         )
-                        print(
-                            f"  已创建 '❌ 缺失和⚠️ 层级不匹配' 工作表，包含 {len(problem_df)} 项 (含缺失项)"
-                        )
+                        log_warn(f"  已创建 '❌ 缺失和⚠️ 层级不匹配' 工作表，包含 {len(problem_df)} 项 (含缺失项)")
+
                     else:
                         empty_df = pd.DataFrame(
                             [{"说明": "🎉 恭喜！未发现缺失或层级不匹配项！"}]
@@ -5204,12 +5427,12 @@ class HierarchicalMatcher:
                                 writer, sheet_name="📋 汇总匹配结果", index=False
                             )
 
-                print(f"✓ 报告已保存: {output_file}")
+                log_info(f'✓ 报告已保存: {output_file}')
                 # 打印工作表信息
                 import openpyxl
 
                 wb = openpyxl.load_workbook(output_file, read_only=True)
-                print(f"  包含的工作表: {', '.join(wb.sheetnames)}")
+                log_debug(f"  包含的工作表: {', '.join(wb.sheetnames)}")
                 wb.close()
                 return output_file
 
@@ -5221,7 +5444,7 @@ class HierarchicalMatcher:
                         f"无法保存报告：尝试了 {max_attempts} 次仍然失败。\n"
                         f"请关闭所有正在使用该文件的程序（如 Excel），然后重试。"
                     )
-                    print(f"✗ {error_msg}")
+                    log_error(f'✗ {error_msg}')
                     raise PermissionError(error_msg)
 
                 # 生成副本文件名
@@ -5230,10 +5453,9 @@ class HierarchicalMatcher:
                 suffix = path.suffix
                 parent = path.parent
                 output_file = str(parent / f"{stem}_副本{attempt}{suffix}")
-                print(f"  ⚠️ 原文件被占用，尝试保存到: {output_file}")
-
+                log_warn(f'  ⚠️ 原文件被占用，尝试保存到: {output_file}')
             except Exception as e:
-                print(f"✗ 保存报告失败: {str(e)}")
+                log_error(f'✗ 保存报告失败: {str(e)}')
                 import traceback
 
                 traceback.print_exc()
@@ -5285,7 +5507,7 @@ class HierarchicalMatcher:
                     return ""
                 return str(val).strip()
             except Exception as e:
-                print(f"[ERROR] safe_get 出错: row类型={type(row)}, key={key}, error={e}")
+                log_error(f'[ERROR] safe_get 出错: row类型={type(row)}, key={key}, error={e}')
                 return default
 
         # === 辅助函数：获取 Word 实际层级（按编号段数计算） ===
@@ -5307,24 +5529,35 @@ class HierarchicalMatcher:
             return child_clean.startswith(parent_clean + ".")
 
         # === 【核心修复】辅助函数：获取所有高置信度候选项（支持多路径） ===
+        # [PERF] 预计算每个 item 的匹配用清洗文本与字符集（原本每候选重复 2 次正则+集合构造）
+        # 注意：word_items 在下方层级结构提取完成后定义，预计算循环放在那里执行
+        def _precompute_match_text(item):
+            item_text = item.get("text", "") or ""
+            cleaned_item_text = self.clean_title_suffix(item_text)
+            cleaned_item_text = re.sub(
+                r"^\d+(?:\.\d+)+[\s\.．、)）:：]*", "", cleaned_item_text
+            ).strip()
+            if cleaned_item_text == item_text:
+                cleaned_item_text = re.sub(
+                    r"^\d+[\.\．\s、)）:：]+", "", cleaned_item_text
+                ).strip()
+            item["_match_clean"] = cleaned_item_text
+            item["_match_key"] = re.sub(
+                r"\s+", "", str(cleaned_item_text).strip().lower()
+            )
+            return item
+
         def get_all_candidates(text, search_space, excel_level, min_score=0.70):
             if not text:
                 return [(None, 0.0)]
             target_clean = re.sub(r"\s+", "", str(text).strip().lower())
+            set1 = set(target_clean)
             candidates = []
             for item in search_space:
-                item_text = item.get("text", "")
-                # 【关键修复 1】先清理无意义后缀（如"（一级功能模块）"）
-                cleaned_item_text = self.clean_title_suffix(item_text)
-                # 【关键修复 2】再清理开头的数字编号（如"1.1 "、"7.1.1 "）
-                # 这样 "1.1个人客户图层（一级功能模块）" 就会变成 "个人客户图层"
-                # 【修复】使用更安全的正则，防止误杀 "1588V2" 这种以数字开头的业务名称
-                # 只有当数字后面紧跟"点+数字"（如1.1）或者"分隔符"（如1. 1、）时才去除
-                cleaned_item_text = re.sub(r"^\d+(?:\.\d+)+[\s\.．、)）:：]*", "", cleaned_item_text).strip()
-                if cleaned_item_text == item_text:  # 如果上面没匹配到（比如是 "1. 标题"），再试一次单数字+分隔符
-                    cleaned_item_text = re.sub(r"^\d+[\.\．\s、)）:：]+", "", cleaned_item_text).strip()
-                # 计算清理后的字符集
-                item_clean = re.sub(r"\s+", "", str(cleaned_item_text).strip().lower())
+                item_clean = item.get("_match_key")
+                if item_clean is None:
+                    _precompute_match_text(item)
+                    item_clean = item["_match_key"]
                 if not item_clean:
                     continue
                 # 层级优先：同层级匹配给予轻微加分
@@ -5334,11 +5567,8 @@ class HierarchicalMatcher:
                 if target_clean == item_clean:
                     score = 1.0
                 else:
-                    # 2. 字符集过滤（改用召回率：Excel 的字符有多少在 Word 里）
-                    set1 = set(target_clean)
+                    # 2. 字符集过滤（召回率：Excel 的字符有多少在 Word 里）
                     set2 = set(item_clean)
-                    # 分母使用 len(set1)，即 Excel 的字符数。
-                    # 只要 Excel 的字符 80% 以上都在 Word 标题里，就放行。
                     overlap = len(set1 & set2) / max(len(set1), 1)
                     if overlap < 0.8:
                         if DETAILED_LOG:
@@ -5346,7 +5576,7 @@ class HierarchicalMatcher:
                                 f"        -> ❌ 跳过(重叠率低 {overlap:.2f}): target='{target_clean}', item='{item_clean}'")
                         continue
                     # 3. 计算相似度（使用清理后的文本计算更准确）
-                    score = self.similarity(text, cleaned_item_text)
+                    score = self.similarity(text, item["_match_clean"])
                 if score + level_bonus >= min_score:
                     candidates.append((item, score))
             # 按分数降序排列
@@ -5430,6 +5660,42 @@ class HierarchicalMatcher:
                 level="DEBUG"
             )
 
+        # [PERF] 预计算匹配文本（item 数 × 1 次清洗，替代匹配循环内的 N×M 次重复清洗）
+        for _pre_item in word_items:
+            if isinstance(_pre_item, dict):
+                _precompute_match_text(_pre_item)
+
+        # [PERF] 编号前缀索引：O(深度) 构建一次，后代查找从 O(N) 全量扫描降为 O(子树大小)
+        _prefix_index: Dict[str, List] = {}
+        for _it in word_items:
+            if not isinstance(_it, dict):
+                continue
+            _parts = _num_parts(_it.get("number") or _it.get("num") or "")
+            for _i in range(1, len(_parts) + 1):
+                _prefix_index.setdefault(".".join(_parts[:_i]), []).append(_it)
+
+        def _descendants_of(num: str) -> List:
+            """严格后代集合（编号以 num. 开头），与 is_descendant 语义一致"""
+            num = _norm_num(num)
+            if not num:
+                return word_items
+            return [
+                _c
+                for _c in _prefix_index.get(num, [])
+                if _norm_num(_c.get("number") or _c.get("num") or "") != num
+            ]
+
+        # [PERF] 每个父编号在其深度上的首个子编号（word_items 按文档顺序，首个即第一个孩子）
+        _first_child_map: Dict[Tuple[str, int], str] = {}
+        for _it in word_items:
+            if not isinstance(_it, dict):
+                continue
+            _parts = _num_parts(_it.get("number") or _it.get("num") or "")
+            if len(_parts) >= 2:
+                _key = (".".join(_parts[:-1]), len(_parts))
+                if _key not in _first_child_map:
+                    _first_child_map[_key] = ".".join(_parts)
+
         def _node_for_num(num: str) -> Dict:
             num = _norm_num(num)
             if not num:
@@ -5452,14 +5718,16 @@ class HierarchicalMatcher:
             prefix_num = _norm_num(prefix_num)
             if not prefix_num:
                 return ""
-            prefix = prefix_num + "."
-            for _num, _it in word_num_index.items():
-                if _num.startswith(prefix) and _num_depth(_num) == target_depth:
-                    return _num
-            return ""
+            return _first_child_map.get((prefix_num, target_depth), "")
+
+        _display_tree_cache: Dict[str, Dict[int, Dict]] = {}
 
         def _compute_display_tree(anchor_num: str) -> Dict[int, Dict]:
-            """根据命中的编号，获取其在 Word 中真实的 1/2/3 级路径"""
+            """根据命中的编号，获取其在 Word 中真实的 1/2/3 级路径（带缓存）"""
+            anchor_num = _norm_num(anchor_num)
+            cached = _display_tree_cache.get(anchor_num)
+            if cached is not None:
+                return cached
             out = {
                 1: {"title": "❌ 缺失", "num": "", "original": ""},
                 2: {"title": "❌ 缺失", "num": "", "original": ""},
@@ -5492,6 +5760,7 @@ class HierarchicalMatcher:
             out[1] = _node_for_num(l1_num)
             out[2] = _node_for_num(l2_num)
             out[3] = _node_for_num(l3_num)
+            _display_tree_cache[anchor_num] = out
             return out
 
         if progress_callback:
@@ -5562,8 +5831,6 @@ class HierarchicalMatcher:
                 RuntimeLogger.log(
                     f"    - L1='{safe_get(_ex, 'level1')}', L2='{safe_get(_ex, 'level2')}', L3='{safe_get(_ex, 'level3')}'")
 
-
-
         for idx, excel_row in enumerate(excel_data):
             if progress_callback and (idx % update_interval == 0 or idx == total - 1):
                 progress_callback(
@@ -5586,11 +5853,9 @@ class HierarchicalMatcher:
             # 遍历每一个 L1 候选分支
             for l1_item, l1_score in l1_candidates:
                 # 确定 L2 的搜索范围（如果 L1 匹配成功，则限制在 L1 的子节点中）
-                l2_search_space = []
+                # [PERF] 使用编号前缀索引 O(子树) 取后代，替代 O(N) 全量扫描
                 if l1_item:
-                    l1_num = l1_item.get("number", "")
-                    l2_search_space = [c for c in word_hierarchy["all_items"] if
-                                       is_descendant(l1_num, c.get("number", ""))]
+                    l2_search_space = _descendants_of(l1_item.get("number", ""))
                 else:
                     l2_search_space = word_hierarchy["all_items"]
 
@@ -5599,15 +5864,11 @@ class HierarchicalMatcher:
                 # 遍历每一个 L2 候选分支
                 for l2_item, l2_score in l2_candidates:
                     # 确定 L3 的搜索范围
-                    l3_search_space = []
+                    # [PERF] 使用编号前缀索引 O(子树) 取后代，替代 O(N) 全量扫描
                     if l2_item:
-                        l2_num = l2_item.get("number", "")
-                        l3_search_space = [c for c in word_hierarchy["all_items"] if
-                                           is_descendant(l2_num, c.get("number", ""))]
+                        l3_search_space = _descendants_of(l2_item.get("number", ""))
                     elif l1_item:
-                        l1_num = l1_item.get("number", "")
-                        l3_search_space = [c for c in word_hierarchy["all_items"] if
-                                           is_descendant(l1_num, c.get("number", ""))]
+                        l3_search_space = _descendants_of(l1_item.get("number", ""))
                     else:
                         l3_search_space = word_hierarchy["all_items"]
 
@@ -5858,7 +6119,7 @@ class HierarchicalMatcher:
                 if DETAILED_LOG:
                     RuntimeLogger.log(f"✓ Word结构树已保存: {hierarchy_log_path}", level="INFO")
             except Exception as e:
-                print(f"警告: 无法保存层级匹配日志: {e}")
+                log_error(f'警告: 无法保存层级匹配日志: {e}')
 
         return report
 
@@ -5870,12 +6131,8 @@ class HierarchicalMatcher:
         """
         try:
             # 打印调试信息
-            print(
-                f"[VALIDATE] 验证参数: excel_file={type(excel_file)}, sheet={sheet_name}"
-            )
-            print(
-                f"[VALIDATE] 列设置: l1={level1_col}, l2={level2_col}, l3={level3_col}, header={header}"
-            )
+            log_info(f'[VALIDATE] 验证参数: excel_file={type(excel_file)}, sheet={sheet_name}')
+            log_info(f'[VALIDATE] 列设置: l1={level1_col}, l2={level2_col}, l3={level3_col}, header={header}')
 
             # 确保参数是整数
             try:
@@ -5884,7 +6141,7 @@ class HierarchicalMatcher:
                 l3 = int(level3_col) if level3_col is not None else 2
                 hdr = int(header) if header is not None else 0
             except ValueError as e:
-                print(f"[ERROR] 参数类型错误: {e}")
+                log_error(f'[ERROR] 参数类型错误: {e}')
                 return False, f"参数类型错误: {e}"
 
             # 尝试读取Excel文件
@@ -5893,10 +6150,10 @@ class HierarchicalMatcher:
             try:
                 if isinstance(excel_file, pd.DataFrame):
                     df = excel_file
-                    print(f"[VALIDATE] 使用提供的DataFrame，形状: {df.shape}")
+                    log_info(f'[VALIDATE] 使用提供的DataFrame，形状: {df.shape}')
                 elif isinstance(excel_file, str):
                     df = pd.read_excel(excel_file, sheet_name=sheet_name, header=hdr)
-                    print(f"[VALIDATE] 从文件读取DataFrame，形状: {df.shape}")
+                    log_info(f'[VALIDATE] 从文件读取DataFrame，形状: {df.shape}')
                 else:
                     return False, f"不支持的excel_file类型: {type(excel_file)}"
 
@@ -5916,11 +6173,11 @@ class HierarchicalMatcher:
                 return True, f"验证通过: {len(df)}行, {len(df.columns)}列"
 
             except Exception as e:
-                print(f"[ERROR] 读取Excel失败: {e}")
+                log_error(f'[ERROR] 读取Excel失败: {e}')
                 return False, f"读取Excel失败: {e}"
 
         except Exception as e:
-            print(f"[ERROR] 验证过程异常: {e}")
+            log_error(f'[ERROR] 验证过程异常: {e}')
             import traceback
 
             traceback.print_exc()
@@ -5933,7 +6190,7 @@ class HierarchicalMatcher:
         import win32com.client
         import time as time_module
 
-        print(f"⚠️ [PERF] 降级到 COM 物理遍历模式...")
+        log_debug(f'⚠️ [PERF] 降级到 COM 物理遍历模式...')
         start_scan_time = time_module.time()
 
         word = None
@@ -5966,11 +6223,11 @@ class HierarchicalMatcher:
                 except:
                     continue
 
-            print(f"✅ [PERF] COM 遍历完成: 提取 {len(result)} 项, 耗时 {time_module.time() - start_scan_time:.2f}s")
+            log_debug(f'✅ [PERF] COM 遍历完成: 提取 {len(result)} 项, 耗时 {time_module.time() - start_scan_time:.2f}s')
             return result
 
         except Exception as e:
-            print(f"❌ COM 提取也失败: {e}")
+            log_error(f'❌ COM 提取也失败: {e}')
             return []
         finally:
             try:

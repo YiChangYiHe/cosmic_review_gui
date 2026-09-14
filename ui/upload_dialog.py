@@ -2,9 +2,7 @@ import os
 import re
 import pandas as pd
 from openpyxl import load_workbook
-
-
-
+from utils.runtime_logger import RuntimeLogger
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -41,7 +39,9 @@ from utils.document_processor import DocumentProcessor
 from utils.similarity_checker import SimilarityChecker
 from utils.archive_utils import ArchiveUtils  # ✅ 导入压缩包处理工具
 from utils.styles import apply_dark_title_bar
-from utils.path_utils import get_resource_path
+from utils.themes import get_tokens, is_dark_mode
+from utils.path_utils import get_resource_path, clean_project_name
+from utils.runtime_logger import log_debug, log_error, log_info, log_warn
 
 
 class ExcelParseWorker(QThread):
@@ -54,6 +54,9 @@ class ExcelParseWorker(QThread):
         self.file_path = file_path
 
     def run(self):
+        # 【日志分流】解析日志归属项目日志
+        from utils.runtime_logger import RuntimeLogger
+        RuntimeLogger.set_project(self.key)
         try:
             # 调用静态解析方法
             result = UploadDialog.static_parse_excel(self.file_path)
@@ -68,6 +71,7 @@ class ExcelParseWorker(QThread):
                 "columns_info": {"Sheet1": []},
             })
 
+
 class DownOnlyComboBox(QComboBox):
     """强制向下展开并屏蔽滑轮滚动的下拉框"""
 
@@ -76,11 +80,43 @@ class DownOnlyComboBox(QComboBox):
         event.ignore()
 
     def showPopup(self):
-        """重写弹出方法，强制向下展开并设置最大高度"""
+        """重写弹出方法：强制向下展开、锁定最大高度，并给弹层容器
+        运行时上整套主题样式（容器自带底色/滚动条规则，杜绝任何
+        未被全局 QSS 命中的区域露出系统默认的白色横条）"""
         super().showPopup()
         # 获取下拉列表窗口
         popup = self.view().window()
         if popup:
+            from utils.themes import get_tokens, is_dark_mode
+
+            _t = get_tokens(is_dark_mode())
+            popup.setStyleSheet(
+                f"""
+                * {{
+                    background-color: {_t['bg_card']};
+                    color: {_t['text_body']};
+                }}
+                QAbstractItemView {{
+                    border: 1px solid {_t['border']};
+                    border-radius: 8px;
+                    padding: 4px;
+                    outline: none;
+                }}
+                QScrollBar:vertical {{
+                    background: transparent; width: 6px; margin: 2px; border: none;
+                }}
+                QScrollBar::handle:vertical {{
+                    background: {_t['border']}; border-radius: 3px; min-height: 24px;
+                }}
+                QScrollBar::handle:vertical:hover {{ background: {_t['text_sub']}; }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                    height: 0px; width: 0px;
+                }}
+                QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                    background: transparent;
+                }}
+            """
+            )
             # 计算位置：在控件正下方
             pos = self.mapToGlobal(self.rect().bottomLeft())
             popup.move(pos)
@@ -397,8 +433,14 @@ class UploadDialog(QDialog):
     task_submitted = Signal(dict)  # ✅ 新增信号
     """上传任务弹窗 - 新UI外观 + 完整功能"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, prefill_info=None):
         super().__init__(parent)
+        self._prefill_info = prefill_info or {}
+        self._pending_combo_prefill = None
+        # [NEW] 资产清单下拉框预填（待资产清单解析完成后回填）
+        self._pending_asset_prefill = None
+        # [FIX] 预填期间暂停“按文件自动勾选节点”，防止异步解析回调覆盖回显的历史勾选
+        self._prefill_active = bool(self._prefill_info)
         self.setWindowTitle("新建审核任务")
         self.setWindowIcon(QIcon(get_resource_path("ui/logo.ico")))
         self.setMinimumSize(900, 800)
@@ -463,7 +505,7 @@ class UploadDialog(QDialog):
         self.asset_section = self._create_asset_section()
         layout.addWidget(self.asset_section)
         self.asset_section.setVisible(self.asset_checkbox.isChecked())
-        
+
         # ========== 5.6 数据属性重复检测设置 ==========
         self.data_attr_section = self._create_data_attr_section()
         layout.addWidget(self.data_attr_section)
@@ -479,6 +521,9 @@ class UploadDialog(QDialog):
         # ========== 7. 底部按钮 ==========
         footer = self._create_footer()
         main_layout.addWidget(footer)
+
+        # [NEW] 历史项目重新初评：预填上次的材料与选项
+        self._apply_prefill()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         """支持全局拖拽进入"""
@@ -511,6 +556,30 @@ class UploadDialog(QDialog):
         layout = QVBoxLayout(section)
         layout.setSpacing(15)
         layout.setContentsMargins(25, 10, 25, 20)
+
+        # 【新增】项目名称输入框
+        name_row = QHBoxLayout()
+        name_row.setAlignment(Qt.AlignVCenter)
+        name_label = QLabel("项目名称:")
+        name_label.setFixedWidth(110)
+        name_label.setStyleSheet("font-size: 13px; font-weight: 600;")
+
+        self.project_name_input = QLineEdit()
+        self.project_name_input.setPlaceholderText("默认自动提取，可手动修改（用于报告归档和展示）")
+        self.project_name_input.setFixedHeight(38)
+        # 样式跟随主题（原先硬编码浅色边框，深色模式下刺眼）
+        _t = get_tokens(is_dark_mode())
+        self.project_name_input.setStyleSheet(
+            f"""
+                    QLineEdit {{ padding: 8px 12px; border: 1px solid {_t['border']}; border-radius: 8px;
+                                 font-size: 13px; background: {_t['input_bg']}; color: {_t['text_body']}; }}
+                    QLineEdit:focus {{ border-color: {_t['accent']}; }}
+                """
+        )
+
+        name_row.addWidget(name_label)
+        name_row.addWidget(self.project_name_input, stretch=1)
+        layout.addLayout(name_row)
 
         # 人天输入
         row = QHBoxLayout()
@@ -576,29 +645,63 @@ class UploadDialog(QDialog):
 
         layout.addWidget(files_scroll)
 
+        # [NEW] 目录树txt导入（可选）：超大项目已有此前导出的 Word结构树.txt 时
+        # 可直接导入，第0步跳过整篇文档解析
+        tree_row = QHBoxLayout()
+        self.import_tree_btn = QPushButton("📂 导入目录树txt（可选）")
+        self.import_tree_btn.setFixedHeight(30)
+        self.import_tree_btn.setCursor(Qt.PointingHandCursor)
+        self.import_tree_btn.setToolTip(
+            "此前运行导出过《XX-Word结构树.txt》时可直接导入，"
+            "第0步将直接基于该文件构建层级树，无需重新解析大文档"
+        )
+        self.import_tree_btn.clicked.connect(self.on_import_tree_txt)
+        self.tree_txt_label = ElidedLabel("未导入（将正常解析Word文档结构）")
+        self.tree_txt_label.setStyleSheet(
+            f"font-size: 12px; color: {get_tokens(is_dark_mode())['text_sub']};"
+        )
+        tree_row.addWidget(self.import_tree_btn)
+        tree_row.addWidget(self.tree_txt_label, 1)
+        layout.addLayout(tree_row)
+
         return section
+
+    def on_import_tree_txt(self):
+        """选择此前导出的 Word结构树.txt，注入任务信息供第0步直接使用"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择目录树txt文件", "", "Text files (*.txt);;All files (*)"
+        )
+        if path:
+            self.tree_txt_path = path
+            self.tree_txt_label.setText(path)
+            QMessageBox.information(
+                self,
+                "导入成功",
+                "已导入目录树txt，审核时第0步将直接使用该结构树，"
+                "无需重新解析Word文档。",
+            )
 
     def _create_node_selection_section(self):
         """创建节点选择区域(取代原匹配模式选择)"""
         section = QGroupBox()
-        
+
         # 创建主垂直布局
         main_layout = QVBoxLayout(section)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        
+
         # 头部区域：左侧标题 + 右侧按钮
         header_widget = QWidget()
         section_header_layout = QHBoxLayout(header_widget)
         section_header_layout.setContentsMargins(25, 12, 25, 0)
-        
+
         # 标题标签
         title_label = QLabel(" 审核节点选择 (可多选)")
         title_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         section_header_layout.addWidget(title_label)
-        
+
         section_header_layout.addStretch()
-        
+
         # 全选/全不选按钮
         self.select_all_btn = QPushButton("全选")
         self.select_all_btn.setFixedSize(70, 28)
@@ -621,7 +724,7 @@ class UploadDialog(QDialog):
         """)
         self.select_all_btn.clicked.connect(self.select_all_nodes)
         section_header_layout.addWidget(self.select_all_btn)
-        
+
         self.deselect_all_btn = QPushButton("全不选")
         self.deselect_all_btn.setFixedSize(70, 28)
         self.deselect_all_btn.setCursor(Qt.PointingHandCursor)
@@ -643,9 +746,9 @@ class UploadDialog(QDialog):
         """)
         self.deselect_all_btn.clicked.connect(self.deselect_all_nodes)
         section_header_layout.addWidget(self.deselect_all_btn)
-        
+
         main_layout.addWidget(header_widget)
-        
+
         # 主内容布局
         content_layout = QVBoxLayout()
         content_layout.setSpacing(15)
@@ -923,20 +1026,20 @@ class UploadDialog(QDialog):
 
     def on_sheet_changed(self, index):
         """层级模式：工作表变更时更新列下拉框和列信息显示"""
-        print(f"\n[SHEET-CHANGED] on_sheet_changed called, index={index}")
+        log_debug(f'\n[SHEET-CHANGED] on_sheet_changed called, index={index}')
         if index < 0:
             return
 
         # 获取选中的工作表名称
         sheet_name = self.excel_sheet_combo.itemData(index)
-        print(f"[SHEET-CHANGED] itemData({index}) = '{sheet_name}'")
+        log_debug(f"[SHEET-CHANGED] itemData({index}) = '{sheet_name}'")
         if not sheet_name:
             sheet_name = self.excel_sheet_combo.itemText(index)
-            print(f"[SHEET-CHANGED] Fallback to itemText: '{sheet_name}'")
+            log_debug(f"[SHEET-CHANGED] Fallback to itemText: '{sheet_name}'")
             # 从显示文本中提取工作表名称
             if "、" in sheet_name:
                 sheet_name = sheet_name.split("、", 1)[1]
-                print(f"[SHEET-CHANGED] Extracted sheet name: '{sheet_name}'")
+                log_debug(f"[SHEET-CHANGED] Extracted sheet name: '{sheet_name}'")
 
         # 获取第一个有效的Excel文件信息
         excel_key = None
@@ -945,25 +1048,25 @@ class UploadDialog(QDialog):
                 excel_key = key
                 break
 
-        print(f"[SHEET-CHANGED] Selected excel_key: {excel_key}")
+        log_debug(f'[SHEET-CHANGED] Selected excel_key: {excel_key}')
         if not excel_key:
-            print("[SHEET-CHANGED] No valid Excel key, returning early")
+            log_debug('[SHEET-CHANGED] No valid Excel key, returning early')
             return
 
         # 获取该工作表的列信息
         excel_data = self.excel_info.get(excel_key)
-        print(f"[SHEET-CHANGED] Excel data keys: {list(excel_data.keys()) if excel_data else None}")
+        log_debug(f'[SHEET-CHANGED] Excel data keys: {(list(excel_data.keys()) if excel_data else None)}')
         if not excel_data:
-            print("[SHEET-CHANGED] No excel data, returning early")
+            log_debug('[SHEET-CHANGED] No excel data, returning early')
             return
 
         columns_info = excel_data.get("columns_info", {}).get(sheet_name, [])
-        print(f"[SHEET-CHANGED] Columns for sheet '{sheet_name}': {len(columns_info)} columns")
+        log_debug(f"[SHEET-CHANGED] Columns for sheet '{sheet_name}': {len(columns_info)} columns")
         if columns_info:
-            print(f"[SHEET-CHANGED] Column details: {[(col['letter'], col['name']) for col in columns_info[:5]]}")
+            log_debug(f"[SHEET-CHANGED] Column details: {[(col['letter'], col['name']) for col in columns_info[:5]]}")
 
-        print(f"\n工作表 '{sheet_name}' 变更，更新列下拉框")
-        print(f"列信息: {[(col['letter'], col['name']) for col in columns_info]}")
+        log_debug(f"\n工作表 '{sheet_name}' 变更，更新列下拉框")
+        log_info(f"列信息: {[(col['letter'], col['name']) for col in columns_info]}")
 
         # 更新所有列下拉框
         self.update_column_combo(self.level1_combo, columns_info, "一级模块列")
@@ -1065,14 +1168,15 @@ class UploadDialog(QDialog):
     def handle_files(self, files):
         """处理上传的文件"""
         try:
-            print("=" * 50)
-            print("开始处理文件:")
-
+            # [FIX] 用户手动添加新文件后，恢复"按文件自动勾选节点"的规则
+            self._prefill_active = False
+            log_info('=' * 50)
+            log_info('开始处理文件:')
             # 新增：预处理压缩包，将其内部文件展开到待处理列表中
             expanded_files = []
             for f in files:
                 if ArchiveUtils.is_archive(f):
-                    print(f"检测到压缩包: {os.path.basename(f)}，正在解压...")
+                    log_info(f'检测到压缩包: {os.path.basename(f)}，正在解压...')
                     extracted = ArchiveUtils.extract_archive(f)
                     expanded_files.extend(extracted)
                 else:
@@ -1083,25 +1187,28 @@ class UploadDialog(QDialog):
                 filename = os.path.basename(file_path)
                 base_name = os.path.splitext(filename)[0]
                 ext = os.path.splitext(filename)[1].lower()
-                print(f"\n原始文件名: {filename}")
-                print(f"基础名称: {base_name}")
-                print(f"扩展名: {ext}")
+                log_info(f'\n原始文件名: {filename}')
+                log_info(f'基础名称: {base_name}')
+                log_info(f'扩展名: {ext}')
 
                 # 清理文件名：去掉前后缀
-                cleaned_name = self.clean_filename(base_name)
-                print(f"清理后名称: '{cleaned_name}'")
+                cleaned_name = clean_project_name(base_name)
+                # 【日志分流】以下为本项目相关内容，写入项目日志而非应用日志
+                from utils.runtime_logger import RuntimeLogger
+                RuntimeLogger.set_project(cleaned_name)
+                log_info(f"清理后名称: '{cleaned_name}'")
 
-                # 强化匹配策略：如果找不到完全一致的 Key，尝试搜寻是否有“高度相似”的 Key（连续 6 个字符相同）
+                # 强化匹配策略：如果找不到完全一致的 Key，尝试搜寻是否有"高度相似"的 Key（连续 6 个字符相同）
                 target_key = cleaned_name
                 if cleaned_name not in self.file_queue:
                     for existing_key in self.file_queue.keys():
                         if self._is_fuzzy_match(cleaned_name, existing_key):
                             target_key = existing_key
-                            print(f"检测到模糊匹配: '{cleaned_name}' 与现有项目 '{existing_key}' 自动合并")
+                            log_info(f"检测到模糊匹配: '{cleaned_name}' 与现有项目 '{existing_key}' 自动合并")
                             break
 
                 if target_key not in self.file_queue:
-                    print(f"新建条目: {target_key}")
+                    log_info(f'新建条目: {target_key}')
                     self.file_queue[target_key] = {
                         "has_word": False,
                         "has_excel": False,
@@ -1110,49 +1217,47 @@ class UploadDialog(QDialog):
                         "file_paths": {"word": None, "excel": None, "asset": None},
                     }
                 else:
-                    print(f"匹配到现有条目: {target_key}")
+                    log_debug(f'匹配到现有条目: {target_key}')
 
                 # 排除需求清单
                 if "需求清单" in filename:
-                    print(f"-> 跳过需求清单: {filename}")
+                    log_info(f'-> 跳过需求清单: {filename}')
                     continue
 
                 # 根据关键字识别文件类型
                 if (ext == ".doc" or ext == ".docx") and "说明书" in filename:
-                    print("-> 标记为 需求说明书")
+                    log_info('-> 标记为 需求说明书')
                     self.file_queue[target_key]["has_word"] = True
                     self.file_queue[target_key]["original_names"]["word"] = filename
                     self.file_queue[target_key]["file_paths"]["word"] = file_path
-
                 elif ext == ".xlsx" and "拆分表" in filename:
-                    print("-> 标记为 拆分表")
+                    log_info('-> 标记为 拆分表')
                     self.file_queue[target_key]["has_excel"] = True
                     self.file_queue[target_key]["original_names"]["excel"] = filename
                     self.file_queue[target_key]["file_paths"]["excel"] = file_path
-
                     # ✅ 【修改点1】：启动后台线程解析，不再同步阻塞 UI
-                    print(f"[CALL] Starting background parse for Excel with key='{target_key}'")
+                    log_debug(f"[CALL] Starting background parse for Excel with key='{target_key}'")
                     self.parse_excel_file(target_key, file_path, is_asset=False)
-
                 elif ext == ".xlsx" and "资产" in filename:
-                    print("-> 标记为 资产清单")
+                    log_info('-> 标记为 资产清单')
                     self.file_queue[target_key]["has_asset"] = True
                     self.file_queue[target_key]["original_names"]["asset"] = filename
                     self.file_queue[target_key]["file_paths"]["asset"] = file_path
-
                     # ✅ 【修改点2】：启动后台线程解析，标记为资产。
                     # 原本这里复杂的 excel_info/asset_info 切换保护逻辑已移至 on_asset_parse_finished 回调中
-                    print(f"[CALL] Starting background parse for Asset with key='{target_key}'")
+                    log_debug(f"[CALL] Starting background parse for Asset with key='{target_key}'")
                     self.parse_excel_file(target_key, file_path, is_asset=True)
-
                 else:
-                    print(f"-> 忽略不符合条件的文件: {filename}")
+                    log_info(f'-> 忽略不符合条件的文件: {filename}')
 
-            print("\n当前文件队列状态:")
+                # 恢复无项目上下文（后续 UI 事件走应用日志）
+                from utils.runtime_logger import RuntimeLogger
+                RuntimeLogger.set_project(None)
+
+            log_info('\n当前文件队列状态:')
             for key, value in self.file_queue.items():
-                print(
-                    f"  '{key}': Word={value['has_word']}, Excel={value['has_excel']}, Asset={value.get('has_asset', False)}")
-            print("=" * 50)
+                log_info(f"  '{key}': Word={value['has_word']}, Excel={value['has_excel']}, Asset={value.get('has_asset', False)}")
+            log_info('=' * 50)
 
             # ✅ 【修改点3】：立即更新文件队列显示。
             # 注意：在异步模式下，这里不需要调用 update_excel_combos()，
@@ -1160,11 +1265,23 @@ class UploadDialog(QDialog):
             # 下拉框的更新将由后台线程完成后的信号回调 (on_excel_parse_finished) 自动触发。
             self.update_queue_display()
 
+            # ================= 【新增】自动填充项目名称 =================
+            # 如果项目名称输入框存在且为空，则自动从文件队列中提取第一个名称填入
+            if hasattr(self, 'project_name_input') and not self.project_name_input.text().strip():
+                default_name = ""
+                # 遍历文件队列，取第一个 key 作为默认项目名
+                for key in self.file_queue.keys():
+                    default_name = key
+                    break
+                if default_name:
+                    self.project_name_input.setText(default_name)
+            # ============================================================
+
         except Exception as e:
             from PySide6.QtWidgets import QMessageBox
             import traceback
             error_msg = f"处理文件时发生意外错误:\n{str(e)}\n\n{traceback.format_exc()}"
-            print(error_msg)
+            log_error(error_msg)
             QMessageBox.critical(self, "错误", error_msg)
 
     def parse_excel_file(self, key, file_path, is_asset=False):
@@ -1184,9 +1301,197 @@ class UploadDialog(QDialog):
     def on_excel_parse_finished(self, key, data):
         """拆分表解析完成回调"""
         self.excel_info[key] = data
+        log_debug(f'[DEBUG] Excel解析完成，开始预填下拉框')
         self.update_excel_combos()
         self.update_queue_display()
+        # [NEW] 重新初评预填：Excel 解析完成后恢复工作表/列选择
+        if getattr(self, "_pending_combo_prefill", None):
+            try:
+                self._apply_combo_prefill(self._pending_combo_prefill)
+            finally:
+                self._pending_combo_prefill = None
 
+    def _select_sheet_combo(self, combo, sheet_name):
+        """按下拉框 data(工作表名) 选中工作表"""
+        if sheet_name is None:
+            return
+        idx = combo.findData(sheet_name)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    def _select_column_combo(self, combo, col_index):
+        """按 col_info.index 选中列"""
+        if col_index is None:
+            return
+        for i in range(combo.count()):
+            d = combo.itemData(i)
+            if isinstance(d, dict) and d.get("index") == col_index:
+                combo.setCurrentIndex(i)
+                return
+
+    def _apply_combo_prefill(self, pf):
+        """[优化] 恢复上次的工作表与列选择（静默模式，不触发联动日志）"""
+        if not pf:
+            return
+
+        # 1. 阻断信号：防止选中下拉框时触发 on_sheet_changed，避免日志刷屏和界面闪烁
+        combos_to_block = [
+            self.simple_excel_combo, self.excel_sheet_combo,
+            self.func_combo, self.level1_combo, self.level2_combo, self.level3_combo
+        ]
+        # 如果有资产清单下拉框，也加入阻断
+        if hasattr(self, 'asset_sheet_combo'):
+            combos_to_block.append(self.asset_sheet_combo)
+        if hasattr(self, 'asset_level_combos'):
+            combos_to_block.extend(self.asset_level_combos)
+
+        for c in combos_to_block:
+            if c: c.blockSignals(True)
+
+        try:
+            # 2. 执行预填逻辑（此时不会触发任何槽函数）
+            self._select_sheet_combo(self.simple_excel_combo, pf.get("simple_sheet"))
+            self._select_sheet_combo(self.excel_sheet_combo, pf.get("hierarchy_sheet"))
+
+            self._select_column_combo(self.func_combo, pf.get("functional_column_index"))
+            self._select_column_combo(self.level1_combo, pf.get("level1_column_index"))
+            self._select_column_combo(self.level2_combo, pf.get("level2_column_index"))
+            self._select_column_combo(self.level3_combo, pf.get("level3_column_index"))
+
+            # 资产清单预填
+            if hasattr(self, 'asset_sheet_combo') and hasattr(self, 'asset_level_combos'):
+                self._select_sheet_combo(self.asset_sheet_combo, pf.get("asset_sheet"))
+                for i, combo in enumerate(self.asset_level_combos):
+                    key_map = ["asset_level1_index", "asset_level2_index", "asset_level3_index"]
+                    self._select_column_combo(combo, pf.get(key_map[i]))
+
+            RuntimeLogger.log(f"[UI] 历史配置下拉框已静默恢复", level="DEBUG")
+
+        finally:
+            # 3. 恢复信号：预填完毕后，恢复联动功能
+            for c in combos_to_block:
+                if c: c.blockSignals(False)
+
+    def _apply_prefill(self):
+        """[NEW] 历史项目重新初评：把上次的材料与选项预填进对话框"""
+        pf = getattr(self, "_prefill_info", None)
+        log_info('=' * 60)
+        log_debug(f'[DEBUG] 预填数据: {pf is not None}')
+        log_debug(f'[DEBUG] 预填数据内容: {pf}')
+        log_info('=' * 60)
+        if not pf:
+            return
+        try:
+            # ================= 【新增】回显项目名称 =================
+            if hasattr(self, 'project_name_input') and pf.get('filename'):
+                self.project_name_input.setText(pf['filename'])
+                log_info(f"[PREFILL] 恢复项目名称: {pf['filename']}")
+            # =====================================================
+            # 1. 材料（Word / 拆分表 / 资产清单）
+            pair = (pf.get("file_pairs") or [{}])[0]
+            if not isinstance(pair, dict):
+                pair = {}
+            word = pair.get("word")
+            excel = pair.get("excel")
+            # [FIX] 资产清单兼容两种记录位置：file_pairs[].asset 优先，其次顶层 asset_excel
+            asset = pair.get("asset") or pf.get("asset_excel")
+            have_any = any(p and os.path.exists(str(p)) for p in (word, excel, asset))
+            if have_any:
+                # [FIX] 直接按槽位注入，不依赖文件名关键字识别（历史材料名未必含"说明书/拆分表"）
+                from utils.path_utils import clean_project_name
+
+                base = excel or word or asset
+                key = clean_project_name(os.path.splitext(os.path.basename(str(base)))[0])
+                if key not in self.file_queue:
+                    self.file_queue[key] = {
+                        "has_word": False,
+                        "has_excel": False,
+                        "has_asset": False,
+                        "original_names": {"word": None, "excel": None, "asset": None},
+                        "file_paths": {"word": None, "excel": None, "asset": None},
+                    }
+                entry = self.file_queue[key]
+                if excel and os.path.exists(str(excel)):
+                    entry["has_excel"] = True
+                    entry["original_names"]["excel"] = os.path.basename(str(excel))
+                    entry["file_paths"]["excel"] = str(excel)
+                    self.parse_excel_file(key, str(excel), is_asset=False)
+                if word and os.path.exists(str(word)):
+                    entry["has_word"] = True
+                    entry["original_names"]["word"] = os.path.basename(str(word))
+                    entry["file_paths"]["word"] = str(word)
+                # [FIX] 资产清单同样注入文件队列（显示"A"图标）并后台解析，
+                #       否则资产清单匹配设置区不会随 asset_checkbox 一起回显
+                if asset and os.path.exists(str(asset)):
+                    entry["has_asset"] = True
+                    entry["original_names"]["asset"] = os.path.basename(str(asset))
+                    entry["file_paths"]["asset"] = str(asset)
+                    self.parse_excel_file(key, str(asset), is_asset=True)
+                self.update_queue_display()
+                self._pending_combo_prefill = {
+                    "simple_sheet": pf.get("simple_sheet"),
+                    "hierarchy_sheet": pf.get("hierarchy_sheet"),
+                    "functional_column_index": pf.get("functional_column_index"),
+                    "level1_column_index": pf.get("level1_column_index"),
+                    "level2_column_index": pf.get("level2_column_index"),
+                    "level3_column_index": pf.get("level3_column_index"),
+                }
+                # [NEW] 资产清单工作表/层级列，待资产清单后台解析完成后回填
+                self._pending_asset_prefill = {
+                    "asset_sheet": pf.get("asset_sheet"),
+                    "asset_level1_index": pf.get("asset_level1_index"),
+                    "asset_level2_index": pf.get("asset_level2_index"),
+                    "asset_level3_index": pf.get("asset_level3_index"),
+                }
+            # 2. 基础选项
+            if str(pf.get("days", "")).strip():
+                self.days_input.setText(str(pf["days"]))
+            checks = {
+                "check_template": "run_template",
+                "check_empty": "run_empty",
+                "check_ratio": "run_ratio",
+                "check_factors": "run_factors",
+                "hierarchy_checkbox": "run_hierarchy",
+                "simple_checkbox": "run_simple",
+                "dm_checkbox": "run_move",
+                "asset_checkbox": "run_asset",
+                "data_attr_checkbox": "run_data_attribute_check",
+            }
+            for attr, key in checks.items():
+                cb = getattr(self, attr, None)
+                if cb is not None:
+                    cb.setChecked(bool(pf.get(key, False)))
+            if hasattr(self, "auto_numbering_check"):
+                self.auto_numbering_check.setChecked(
+                    bool(pf.get("auto_numbering", False))
+                )
+            if hasattr(self, "fuzzy_check"):
+                self.fuzzy_check.setChecked(bool(pf.get("fuzzy", True)))
+            if hasattr(self, "threshold_slider"):
+                try:
+                    self.threshold_slider.setValue(
+                        int(float(pf.get("threshold", 0.8)) * 100)
+                    )
+                except Exception:
+                    pass
+            # [NEW] 回显数据属性重复检测关键词
+            kw = pf.get("data_attr_keywords")
+            if kw:
+                try:
+                    self.data_attr_keywords_input.setText(
+                        ", ".join(str(k) for k in kw)
+                    )
+                except Exception:
+                    pass
+            # [NEW] 回显此前导入的目录树txt
+            tree_txt = pf.get("tree_txt")
+            if tree_txt and os.path.exists(str(tree_txt)):
+                self.tree_txt_path = str(tree_txt)
+                self.tree_txt_label.setText(str(tree_txt))
+            # [FIX] 复选框恢复完毕后，同步各设置区域的显隐状态
+            self.on_mode_checkbox_changed(0)
+        except Exception as e:
+            log_warn(f'[WARN] 预填历史任务配置失败: {e}')
     def on_asset_parse_finished(self, key, data):
         """资产清单解析完成回调"""
         # 关键修复：先保存可能已存在的拆分表数据，防止被覆盖
@@ -1197,16 +1502,269 @@ class UploadDialog(QDialog):
 
         self.update_asset_combos()
         self.update_queue_display()
+        # [NEW] 重新初评预填：资产清单解析完成后恢复工作表/层级列选择
+        if getattr(self, "_pending_asset_prefill", None):
+            try:
+                self._apply_asset_combo_prefill(self._pending_asset_prefill)
+            finally:
+                self._pending_asset_prefill = None
+
+    def _apply_asset_combo_prefill(self, pf):
+        """[NEW] 恢复上次资产清单的工作表与一/二/三级对应列选择"""
+        # 先选工作表：会触发 on_asset_sheet_changed 自动重填层级列下拉框，之后再选列
+        self._select_sheet_combo(self.asset_sheet_combo, pf.get("asset_sheet"))
+        combos = self.asset_level_combos
+        self._select_column_combo(combos[0], pf.get("asset_level1_index"))
+        self._select_column_combo(combos[1], pf.get("asset_level2_index"))
+        self._select_column_combo(combos[2], pf.get("asset_level3_index"))
+
+    @staticmethod
+    def _get_header_keywords_for_sheet(sheet_name):
+        """表头打分关键词（按工作表名分级）"""
+        sheet_lower = str(sheet_name).lower()
+        if any(kw in sheet_lower for kw in ["拆分", "功能点", "功能过程"]):
+            return {
+                "high": ["一级模块", "二级模块", "三级模块", "一级功能", "二级功能", "三级功能"],
+                "medium": ["模块", "功能", "层级", "级别", "过程"],
+                "low": ["名称", "分类", "项目", "序号", "编号", "描述", "备注", "类型", "状态", "系统", "内容"]
+            }
+        elif any(kw in sheet_lower for kw in ["资产", "清单", "建设", "工作量"]):
+            return {
+                "high": ["建设目标", "一级分类", "二级分类", "功能模块", "功能点名称", "功能点描述", "资产类别",
+                         "工作量"],
+                "medium": ["分类", "模块", "功能", "资产", "清单", "建设"],
+                "low": ["名称", "描述", "序号", "编号", "备注", "类型", "状态", "内容", "分析", "复用", "共享"]
+            }
+        else:
+            return {
+                "high": [],
+                "medium": ["模块", "功能", "名称", "分类", "级别", "层级", "项目", "序号", "编号"],
+                "low": ["描述", "备注", "类型", "状态", "系统", "举措", "内容", "过程", "资产", "清单", "拆分",
+                        "一级", "二级", "三级"]
+            }
+
+    _NEGATIVE_KEYWORDS = [
+        "非必填", "按需", "非必要", "必填", "选填", "示例", "例如",
+        "请删除", "请在正式提交时删除", "修订标识", "OPEX", "CAPEX", "填写注意",
+        "如项目较小", "如项目较大", "项目名称", "Sheet表的名字不允许"
+    ]
+
+    @staticmethod
+    def _score_header_row(row_values, row_idx, sheet_name=""):
+        """表头行打分（与旧逻辑一致）"""
+        if not row_values:
+            return -1000
+        keywords = UploadDialog._get_header_keywords_for_sheet(sheet_name)
+        score = 0
+        row_text = " ".join(row_values)
+        has_level1 = any(kw in row_text for kw in ["一级模块", "一级功能"])
+        has_level2 = any(kw in row_text for kw in ["二级模块", "二级功能"])
+        has_level3 = any(kw in row_text for kw in ["三级模块", "三级功能"])
+        if has_level1 and has_level2 and has_level3:
+            score += 500
+        for v in row_values:
+            v_str = str(v).strip()
+            for kw in UploadDialog._NEGATIVE_KEYWORDS:
+                if kw in v_str:
+                    score -= 120
+            for kw in keywords["high"]:
+                if kw in v_str:
+                    score += 50
+            for kw in keywords["medium"]:
+                if kw in v_str:
+                    score += 20
+            for kw in keywords["low"]:
+                if kw in v_str:
+                    score += 10
+        if row_idx == 0:
+            score += 8
+        elif row_idx < 3:
+            score += 35
+        elif row_idx < 6:
+            score += 20
+        elif row_idx < 10:
+            score += 5
+        else:
+            score -= 20
+        non_empty_count = len(row_values)
+        if non_empty_count >= 6:
+            score += 20
+        elif non_empty_count >= 4:
+            score += 12
+        elif non_empty_count >= 2:
+            score += 5
+        return score
+
+    @staticmethod
+    def _read_merged_ranges(file_path, sheet_name):
+        """[PERF] 从 XLSX 包内 XML 直读合并单元格范围（毫秒级），替代整本 load_workbook"""
+        import zipfile
+        import re
+        from xml.etree import ElementTree as ET
+        NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        NS_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+        try:
+            with zipfile.ZipFile(file_path) as z:
+                names = set(z.namelist())
+                rels = {}
+                if "xl/_rels/workbook.xml.rels" in names:
+                    rel_root = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+                    for rel in rel_root:
+                        rels[rel.get("Id")] = rel.get("Target")
+                wb_root = ET.fromstring(z.read("xl/workbook.xml"))
+                target = None
+                for sh in wb_root.iter(f"{NS_MAIN}sheet"):
+                    if sh.get("name") == sheet_name:
+                        t = (rels.get(sh.get(f"{NS_R}id")) or "").lstrip("/")
+                        target = t if t.startswith("xl/") else "xl/" + t
+                        break
+                if not target or target not in names:
+                    return []
+                data = z.read(target)
+                m = re.search(rb"<mergeCells[^>]*>(.*?)</mergeCells>", data, re.S)
+                if not m:
+                    return []
+                return [r.decode("ascii") for r in re.findall(rb'ref="([A-Z]+\d+:[A-Z]+\d+)"', m.group(1))]
+        except Exception as e:
+            log_debug(f"[SMART-merged] 直读合并范围失败（忽略，按无合并处理）: {e}")
+            return []
+
+    @staticmethod
+    def _probe_sheet_header(ws, file_path, sheet_name, probe_rows=10):
+        """[PERF] 流式读取前 probe_rows 行做表头探测（默认10行）。
+        合并表头场景从 XML 直读合并范围并回填，全程不整本加载工作簿。
+        返回 columns_info 列表（结构与旧版一致）。"""
+        from openpyxl.utils.cell import range_boundaries
+
+        # 1. 流式读取前 N 行（read_only 模式下 openpyxl 只解析到 max_row 即停）
+        rows = []
+        for row in ws.iter_rows(min_row=1, max_row=probe_rows, values_only=True):
+            rows.append(list(row))
+        if not rows:
+            rows = [[]]
+
+        # 2. 与探测区相交的合并范围（可能扩列，上限300列）
+        merged_bounds = []
+        for ref in UploadDialog._read_merged_ranges(file_path, sheet_name):
+            try:
+                mc, mr, xc, xr = range_boundaries(ref)
+            except Exception:
+                continue
+            if mr <= probe_rows:
+                merged_bounds.append((mc, mr, xc, xr))
+
+        num_cols = max([len(r) for r in rows] + [0])
+        for (mc, _mr, xc, _xr) in merged_bounds:
+            num_cols = max(num_cols, min(xc, 300))
+        num_cols = min(max(num_cols, 1), 300)
+        for r in rows:
+            if len(r) < num_cols:
+                r.extend([None] * (num_cols - len(r)))
+
+        def _row_values(idx):
+            return [str(v).strip() for v in rows[idx] if v is not None and str(v).strip() != ""]
+
+        # 3. 原始网格打分定位表头行
+        best_row_idx, best_score = 0, -1000
+        for i in range(len(rows)):
+            score = UploadDialog._score_header_row(_row_values(i), i, sheet_name)
+            if score > best_score:
+                best_score, best_row_idx = score, i
+
+        non_empty_hdr = len(_row_values(best_row_idx))
+        header_density = non_empty_hdr / max(num_cols, 1)
+        need_merged_fix = header_density < 0.4 and non_empty_hdr < 5
+
+        # 4. 合并表头：回填合并区域值后重新打分（与旧逻辑一致）
+        if need_merged_fix and merged_bounds:
+            for (mc, mr, xc, xr) in merged_bounds:
+                top_left = None
+                if mr - 1 < len(rows) and mc - 1 < len(rows[mr - 1]):
+                    top_left = rows[mr - 1][mc - 1]
+                for rr in range(mr, min(xr, probe_rows) + 1):
+                    for cc in range(mc, min(xc, num_cols) + 1):
+                        if rr - 1 < len(rows) and cc - 1 < len(rows[rr - 1]):
+                            rows[rr - 1][cc - 1] = top_left
+            best_row_idx, best_score = 0, -1000
+            for i in range(len(rows)):
+                score = UploadDialog._score_header_row(_row_values(i), i, sheet_name)
+                if score > best_score:
+                    best_score, best_row_idx = score, i
+            log_debug(f"[SMART-merged] 工作表 '{sheet_name}' 智能定位表头在第 {best_row_idx + 1} 行 (openpyxl流式, 得分: {best_score})")
+        else:
+            log_debug(f"[SMART] 工作表 '{sheet_name}' 智能定位表头在第 {best_row_idx + 1} 行 (得分: {best_score})")
+
+        # 5. 构建 columns_info（结构键与旧版完全一致）
+        sample_idx = best_row_idx + 1
+        column_info = []
+        for i in range(num_cols):
+            header_value = rows[best_row_idx][i] if best_row_idx < len(rows) else None
+            is_empty = not (header_value is not None and str(header_value).strip() != "")
+            if is_empty:
+                for r in range(len(rows)):
+                    v = rows[r][i]
+                    if v is not None and str(v).strip() != "":
+                        is_empty = False
+                        break
+            sample_data = rows[sample_idx][i] if sample_idx < len(rows) else None
+            column_info.append({
+                "index": i, "name": header_value, "header_row": best_row_idx,
+                "source": f"第{best_row_idx + 1}行", "first_row_data": sample_data,
+                "letter": UploadDialog.index_to_excel_column(i), "sample_data": sample_data,
+                "is_empty": is_empty,
+            })
+        return column_info
 
     @staticmethod
     def static_parse_excel(file_path):
-        """【核心解析逻辑】提取为静态方法，供子线程调用"""
-        print(f"\n>>> ENTERING static_parse_excel: file={os.path.basename(file_path)}")
+        """【核心解析逻辑】提取为静态方法，供子线程调用
+
+        [PERF] v2：只流式读取前 10 行做表头探测，合并单元格范围从 XLSX 包内
+        XML 直读，全程 read_only 模式 —— 不再 pandas 全量解析（旧行为：
+        nrows=30 仍会读完整个 10000 行工作表），也不再整本加载工作簿
+        （旧行为：read_only=False 一次构建全部工作表的单元格 DOM）。
+        10000 行大文件解析从 20-30s 降至秒级。"""
+        RuntimeLogger.log(f"\n>>> ENTERING static_parse_excel: file={os.path.basename(file_path)}")
+        # .xls 等旧格式 openpyxl 不支持，走 legacy（pandas）路径
+        if not str(file_path).lower().endswith((".xlsx", ".xlsm")):
+            return UploadDialog._static_parse_excel_legacy(file_path)
         try:
-            print(f"\n解析Excel文件: {file_path}")
+            wb = load_workbook(file_path, read_only=True, data_only=True)
+        except Exception:
+            return UploadDialog._static_parse_excel_legacy(file_path)
+        try:
+            sheet_names = wb.sheetnames
+            log_info(f'工作表列表: {sheet_names}')
+            result_data = {
+                "file_path": file_path,
+                "sheet_names": sheet_names,
+                "columns_info": {},
+            }
+            for sheet_name in sheet_names:
+                try:
+                    result_data["columns_info"][sheet_name] = UploadDialog._probe_sheet_header(
+                        wb[sheet_name], file_path, sheet_name, probe_rows=10
+                    )
+                except Exception as e:
+                    log_error(f"  读取工作表 '{sheet_name}' 时出错: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+            return result_data
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _static_parse_excel_legacy(file_path):
+        """【legacy 兜底】pandas 全量解析路径：仅用于 .xls 旧格式或新版
+        read_only 流式解析异常时的回退。逻辑与旧版 static_parse_excel 一致。"""
+        try:
+            RuntimeLogger.log(f"\n解析Excel文件(legacy): {file_path}", level="DEBUG")
             excel_file = pd.ExcelFile(file_path)
             sheet_names = excel_file.sheet_names
-            print(f"工作表列表: {sheet_names}")
+            log_info(f'工作表列表: {sheet_names}')
 
             result_data = {
                 "file_path": file_path,
@@ -1214,77 +1772,19 @@ class UploadDialog(QDialog):
                 "columns_info": {},
             }
 
-            # --- 以下保留你原来的内部函数和解析逻辑 ---
-            NEGATIVE_KEYWORDS = [
-                "非必填", "按需", "非必要", "必填", "选填", "示例", "例如",
-                "请删除", "请在正式提交时删除", "修订标识", "OPEX", "CAPEX", "填写注意",
-                "如项目较小", "如项目较大", "项目名称", "Sheet表的名字不允许"
-            ]
-
             def get_header_keywords_for_sheet(sheet_name):
-                sheet_lower = str(sheet_name).lower()
-                if any(kw in sheet_lower for kw in ["拆分", "功能点", "功能过程"]):
-                    return {
-                        "high": ["一级模块", "二级模块", "三级模块", "一级功能", "二级功能", "三级功能"],
-                        "medium": ["模块", "功能", "层级", "级别", "过程"],
-                        "low": ["名称", "分类", "项目", "序号", "编号", "描述", "备注", "类型", "状态", "系统", "内容"]
-                    }
-                elif any(kw in sheet_lower for kw in ["资产", "清单", "建设", "工作量"]):
-                    return {
-                        "high": ["建设目标", "一级分类", "二级分类", "功能模块", "功能点名称", "功能点描述", "资产类别",
-                                 "工作量"],
-                        "medium": ["分类", "模块", "功能", "资产", "清单", "建设"],
-                        "low": ["名称", "描述", "序号", "编号", "备注", "类型", "状态", "内容", "分析", "复用", "共享"]
-                    }
-                else:
-                    return {
-                        "high": [],
-                        "medium": ["模块", "功能", "名称", "分类", "级别", "层级", "项目", "序号", "编号"],
-                        "low": ["描述", "备注", "类型", "状态", "系统", "举措", "内容", "过程", "资产", "清单", "拆分",
-                                "一级", "二级", "三级"]
-                    }
+                return UploadDialog._get_header_keywords_for_sheet(sheet_name)
 
             def get_row_score(row_values, row_idx, sheet_name=""):
-                if not row_values: return -1000
-                keywords = get_header_keywords_for_sheet(sheet_name)
-                score = 0
-                row_text = " ".join([str(v).strip() for v in row_values if v and str(v).strip()])
-                has_level1 = any(kw in row_text for kw in ["一级模块", "一级功能"])
-                has_level2 = any(kw in row_text for kw in ["二级模块", "二级功能"])
-                has_level3 = any(kw in row_text for kw in ["三级模块", "三级功能"])
-                if has_level1 and has_level2 and has_level3: score += 500
-                for v in row_values:
-                    v_str = str(v).strip()
-                    for kw in NEGATIVE_KEYWORDS:
-                        if kw in v_str: score -= 120
-                    for kw in keywords["high"]:
-                        if kw in v_str: score += 50
-                    for kw in keywords["medium"]:
-                        if kw in v_str: score += 20
-                    for kw in keywords["low"]:
-                        if kw in v_str: score += 10
-                if row_idx == 0:
-                    score += 8
-                elif row_idx < 3:
-                    score += 35
-                elif row_idx < 6:
-                    score += 20
-                elif row_idx < 10:
-                    score += 5
-                else:
-                    score -= 20
-                non_empty_count = len(row_values)
-                if non_empty_count >= 6:
-                    score += 20
-                elif non_empty_count >= 4:
-                    score += 12
-                elif non_empty_count >= 2:
-                    score += 5
-                return score
+                return UploadDialog._score_header_row(row_values, row_idx, sheet_name)
 
             for sheet_name in sheet_names:
                 try:
-                    df = pd.read_excel(file_path, sheet_name=sheet_name, nrows=30, header=None)
+                    # [PERF] 复用已打开的 ExcelFile（工作表解析后仅取前30行打分）
+                    try:
+                        df = excel_file.parse(sheet_name, nrows=30, header=None)
+                    except TypeError:
+                        df = pd.read_excel(file_path, sheet_name=sheet_name, nrows=30, header=None)
                     probe_max_row = len(df)
                     num_cols = len(df.columns)
                     best_row_idx = 0
@@ -1341,8 +1841,7 @@ class UploadDialog(QDialog):
                                 best_row_idx = i
                         detected_header_row = best_row_idx
                         num_cols = max_col
-                        print(
-                            f"[SMART-merged] 工作表 '{sheet_name}' 智能定位表头在第 {detected_header_row + 1} 行 (openpyxl, 得分: {best_score})")
+                        log_debug(f"[SMART-merged] 工作表 '{sheet_name}' 智能定位表头在第 {detected_header_row + 1} 行 (openpyxl, 得分: {best_score})")
                         column_info = []
                         for i in range(max_col):
                             col_idx = i + 1
@@ -1366,8 +1865,7 @@ class UploadDialog(QDialog):
                             })
                     else:
                         detected_header_row = best_row_idx
-                        print(
-                            f"[SMART] 工作表 '{sheet_name}' 智能定位表头在第 {detected_header_row + 1} 行 (得分: {best_score})")
+                        log_debug(f"[SMART] 工作表 '{sheet_name}' 智能定位表头在第 {detected_header_row + 1} 行 (得分: {best_score})")
                         column_info = []
                         for i in range(num_cols):
                             header_value = df.iloc[best_row_idx, i] if best_row_idx < probe_max_row else None
@@ -1393,12 +1891,12 @@ class UploadDialog(QDialog):
                             })
                     result_data["columns_info"][sheet_name] = column_info
                 except Exception as e:
-                    print(f"  读取工作表 '{sheet_name}' 时出错: {str(e)}")
+                    log_error(f"  读取工作表 '{sheet_name}' 时出错: {str(e)}")
                     import traceback
                     traceback.print_exc()
             return result_data
         except Exception as e:
-            print(f"解析Excel文件失败: {str(e)}")
+            log_error(f'解析Excel文件失败: {str(e)}')
             import traceback
             traceback.print_exc()
             return {
@@ -1406,6 +1904,12 @@ class UploadDialog(QDialog):
                 "sheet_names": ["Sheet1"],
                 "columns_info": {"Sheet1": []},
             }
+        finally:
+            # 释放 pandas 持有的文件句柄，避免文件被占用而无法删除/移动
+            try:
+                excel_file.close()
+            except Exception:
+                pass
 
     @staticmethod
     def index_to_excel_column(index):
@@ -1419,22 +1923,16 @@ class UploadDialog(QDialog):
 
     def update_excel_combos(self):
         """更新所有Excel相关下拉框的选项"""
-        print(f"\n[EXCEL-COMBO] update_excel_combos called")
-        print(f"[EXCEL-COMBO] file_queue keys: {list(self.file_queue.keys())}")
-        print(f"[EXCEL-COMBO] excel_info keys: {list(self.excel_info.keys())}")
+        RuntimeLogger.log(f"[UI] 开始更新Excel下拉框选项", level="DEBUG")
         try:
-            # 获取第一个有效的Excel文件信息
+            # 1. 获取第一个有效的Excel文件信息
             excel_key = None
             for key, info in self.file_queue.items():
-                print(f"[EXCEL-COMBO] Checking key '{key}': has_excel={info['has_excel']}, in excel_info={key in self.excel_info}")
                 if info["has_excel"] and key in self.excel_info:
                     excel_key = key
                     break
 
-            print(f"[EXCEL-COMBO] Selected excel_key: {excel_key}")
             if not excel_key:
-                print("[EXCEL-COMBO] No valid Excel key found, returning early")
-                # ✅ 修复：没有有效 Excel 时，主动清空并提示
                 self.excel_sheet_combo.clear()
                 self.excel_sheet_combo.addItem("无可用工作表", None)
                 self.simple_excel_combo.clear()
@@ -1445,18 +1943,16 @@ class UploadDialog(QDialog):
                 return
 
             excel_data = self.excel_info.get(excel_key)
-            print(f"[EXCEL-COMBO] Excel data keys: {list(excel_data.keys()) if excel_data else None}")
             if not excel_data:
-                print("[EXCEL-COMBO] No excel data, returning early")
                 return
 
-            # 获取工作表列表
             sheet_names = excel_data.get("sheet_names", [])
-            print(f"[EXCEL-COMBO] Sheet names: {sheet_names}")
+            RuntimeLogger.log(f"[UI] 发现工作表: {sheet_names}", level="DEBUG")
 
-            print(f"\n更新下拉框选项，工作表: {sheet_names}")
+            # 2. 填充工作表下拉框
+            self.excel_sheet_combo.blockSignals(True)
+            self.simple_excel_combo.blockSignals(True)
 
-            # 清空并重新填充工作表下拉框
             self.excel_sheet_combo.clear()
             self.simple_excel_combo.clear()
 
@@ -1465,55 +1961,49 @@ class UploadDialog(QDialog):
                 self.excel_sheet_combo.addItem(display_text, sheet_name)
                 self.simple_excel_combo.addItem(display_text, sheet_name)
 
-            # 智能默认选择：优先寻找“功能过程点拆分表”
-            default_sheet_idx = 0  # 兜底选第一个
-            print(f"[EXCEL-COMBO] Starting smart sheet selection, total sheets: {len(sheet_names)}")
-
-            # 第一优先级：包含“功能过程点拆分表”或“功能点拆分表”
+            # 3. 决定默认选中第几个 Sheet (智能选择逻辑)
+            default_sheet_idx = 0
             found_target = False
             for i, name in enumerate(sheet_names):
-                print(f"[EXCEL-COMBO] Checking sheet[{i}] = '{name}' for split table keywords")
                 if any(kw in name for kw in ["功能过程点拆分表", "功能点拆分表"]):
                     default_sheet_idx = i
-                    print(f"[EXCEL-COMBO] Found target sheet: {name} (index {i})")
                     found_target = True
                     break
-
-            # 第二优先级：包含其他常用关键词
             if not found_target:
-                print("[EXCEL-COMBO] No split table found, trying fallback keywords")
                 for i, name in enumerate(sheet_names):
                     if any(keyword in name for keyword in ["功能点", "拆分", "清单", "审核"]):
                         default_sheet_idx = i
-                        print(f"[EXCEL-COMBO] Found fallback sheet: {name} (index {i})")
                         found_target = True
                         break
-
-            # 如果都没找到关键词且工作表够多，可以维持原本尝试选第3个的逻辑(针对特定模板)
             if not found_target and default_sheet_idx == 0 and len(sheet_names) >= 3:
                 default_sheet_idx = 2
-                print(f"[EXCEL-COMBO] No keywords matched, falling back to index 2")
 
-            print(f"[EXCEL-COMBO] Final default_sheet_idx: {default_sheet_idx}")
-
-            # Hierarchy sheet
+            # 4. 选中工作表 (此时信号被阻断，不会触发日志)
             if self.excel_sheet_combo.count() > default_sheet_idx:
                 self.excel_sheet_combo.setCurrentIndex(default_sheet_idx)
-                self.on_sheet_changed(default_sheet_idx)
-            elif self.excel_sheet_combo.count() > 0:
-                self.excel_sheet_combo.setCurrentIndex(0)
-                self.on_sheet_changed(0)
-
-            # Simple sheet
             if self.simple_excel_combo.count() > default_sheet_idx:
                 self.simple_excel_combo.setCurrentIndex(default_sheet_idx)
-                self.on_simple_sheet_changed(default_sheet_idx)
-            elif self.simple_excel_combo.count() > 0:
-                self.simple_excel_combo.setCurrentIndex(0)
-                self.on_simple_sheet_changed(0)
+
+            self.excel_sheet_combo.blockSignals(False)
+            self.simple_excel_combo.blockSignals(False)
+
+            # 5. [关键修复] 手动调用 on_sheet_changed，强制生成列下拉框的选项！
+            # 无论是不是预填，都必须先生成选项，否则预填也没法选
+            RuntimeLogger.log(f"[UI] 手动触发列选项生成...", level="DEBUG")
+            self.on_sheet_changed(default_sheet_idx)  # 生成一级/二级/三级模块列的选项
+            self.on_simple_sheet_changed(default_sheet_idx)  # 生成功能点列的选项
+
+            # 6. [关键修复] 如果是重新初评（有预填数据），最后再执行“选中”操作
+            is_refill = bool(getattr(self, "_pending_combo_prefill", None))
+            if is_refill:
+                RuntimeLogger.log(f"[UI] 执行静默预填选中...", level="DEBUG")
+                try:
+                    self._apply_combo_prefill(self._pending_combo_prefill)
+                finally:
+                    self._pending_combo_prefill = None
 
         except Exception as e:
-            print(f"更新下拉框时出错: {str(e)}")
+            RuntimeLogger.log(f"更新下拉框时出错: {str(e)}", level="ERROR")
 
     def _create_asset_section(self):
         """创建资产清单匹配设置（独立的资产清单列映射配置）"""
@@ -1580,34 +2070,36 @@ class UploadDialog(QDialog):
         layout = QVBoxLayout(section)
         layout.setSpacing(12)
         layout.setContentsMargins(25, 12, 25, 20)
-        
+
         # 关键词模式输入框
         keyword_row = QHBoxLayout()
         keyword_label = QLabel("关键词模式:")
         keyword_label.setFixedWidth(110)
         keyword_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         keyword_label.setStyleSheet("font-size: 12px; font-weight: 600;")
-        
+
         self.data_attr_keywords_input = QLineEdit()
         self.data_attr_keywords_input.setFixedHeight(36)
         self.data_attr_keywords_input.setText("ERX, EW, EX")
         self.data_attr_keywords_input.setToolTip("输入关键词模式，用逗号分隔。例如：ERX, EW, EX")
-        self.data_attr_keywords_input.setStyleSheet("""
-            QLineEdit {
+        self.data_attr_keywords_input.setStyleSheet(f"""
+            QLineEdit {{
                 padding: 8px 12px;
-                border: 2px solid #e2e8f0;
+                border: 2px solid {get_tokens(is_dark_mode())['border']};
                 border-radius: 8px;
                 font-size: 13px;
-            }
-            QLineEdit:focus {
-                border-color: #3b82f6;
-            }
+                background: {get_tokens(is_dark_mode())['input_bg']};
+                color: {get_tokens(is_dark_mode())['text_body']};
+            }}
+            QLineEdit:focus {{
+                border-color: {get_tokens(is_dark_mode())['accent']};
+            }}
         """)
-        
+
         keyword_row.addWidget(keyword_label)
         keyword_row.addWidget(self.data_attr_keywords_input, stretch=1)
         layout.addLayout(keyword_row)
-        
+
         # 提示说明
         hint_text = QLabel(
             " 说明：系统会按这些模式检测跨功能过程的数据属性重复\n"
@@ -1616,31 +2108,32 @@ class UploadDialog(QDialog):
             "   • EX: E(进入) → X(退出)"
         )
         hint_text.setProperty("class", "task-meta")
-        hint_text.setStyleSheet("font-size: 11px; color: #64748b; line-height: 1.5;")
+        hint_text.setStyleSheet(
+            f"font-size: 11px; color: {get_tokens(is_dark_mode())['text_sub']}; line-height: 1.5;")
         hint_text.setWordWrap(True)
         layout.addWidget(hint_text)
-        
+
         return section
 
     def _parse_data_attr_keywords(self):
         """解析用户输入的关键词模式
-        
+
         Returns:
             list: 关键词列表，如 ["ERX", "EW", "EX"]
         """
         if not hasattr(self, 'data_attr_keywords_input'):
             return ["ERX", "EW", "EX"]  # 默认值
-        
+
         text = self.data_attr_keywords_input.text().strip()
         if not text:
             return ["ERX", "EW", "EX"]  # 空输入使用默认值
-        
+
         # 支持中英文逗号分隔
         keywords = [kw.strip().upper() for kw in text.replace('，', ',').split(',') if kw.strip()]
-        
+
         if not keywords:
             return ["ERX", "EW", "EX"]  # 无效输入使用默认值
-        
+
         return keywords
 
     def _first_asset_key(self):
@@ -1652,7 +2145,7 @@ class UploadDialog(QDialog):
 
     def on_asset_sheet_changed(self, index):
         """资产清单：工作表变更时更新资产清单列下拉框"""
-        print(f"\n[ASSET-SHEET] on_asset_sheet_changed called, index={index}")
+        log_debug(f'\n[ASSET-SHEET] on_asset_sheet_changed called, index={index}')
         if index < 0:
             return
 
@@ -1661,37 +2154,37 @@ class UploadDialog(QDialog):
             sheet_name = self.asset_sheet_combo.itemText(index)
             if "、" in sheet_name:
                 sheet_name = sheet_name.split("、", 1)[1]
-        print(f"[ASSET-SHEET] Selected sheet: '{sheet_name}'")
+        log_debug(f"[ASSET-SHEET] Selected sheet: '{sheet_name}'")
 
         asset_key = self._first_asset_key()
-        print(f"[ASSET-SHEET] First asset key: {asset_key}")
+        log_debug(f'[ASSET-SHEET] First asset key: {asset_key}')
         if not asset_key:
-            print("[ASSET-SHEET] No asset key found, returning early")
+            log_debug('[ASSET-SHEET] No asset key found, returning early')
             return
 
         asset_data = self.asset_info.get(asset_key)
-        print(f"[ASSET-SHEET] Asset data keys: {list(asset_data.keys()) if asset_data else None}")
+        log_debug(f'[ASSET-SHEET] Asset data keys: {(list(asset_data.keys()) if asset_data else None)}')
         if not asset_data:
-            print("[ASSET-SHEET] No asset data, returning early")
+            log_debug('[ASSET-SHEET] No asset data, returning early')
             return
 
         columns_info = asset_data.get("columns_info", {}).get(sheet_name, [])
-        print(f"[ASSET-SHEET] Columns info for sheet '{sheet_name}': {len(columns_info)} columns")
+        log_debug(f"[ASSET-SHEET] Columns info for sheet '{sheet_name}': {len(columns_info)} columns")
         if columns_info:
-            print(f"[ASSET-SHEET] Column details: {[(col['letter'], col['name'], col.get('is_empty')) for col in columns_info[:5]]}")
-        print(f"\n资产清单：工作表 '{sheet_name}' 变更，更新列下拉框")
+            log_debug(f"[ASSET-SHEET] Column details: {[(col['letter'], col['name'], col.get('is_empty')) for col in columns_info[:5]]}")
+        log_debug(f"\n资产清单：工作表 '{sheet_name}' 变更，更新列下拉框")
 
         combo_names = ["一级模块列", "二级模块列", "三级模块列"]
         for combo, name in zip(self.asset_level_combos, combo_names):
-            print(f"[ASSET-SHEET] Updating combo '{name}', current count: {combo.count()}")
+            log_debug(f"[ASSET-SHEET] Updating combo '{name}', current count: {combo.count()}")
             self.update_column_combo(combo, columns_info, name)
-            print(f"[ASSET-SHEET] After update, combo '{name}' count: {combo.count()}")
+            log_debug(f"[ASSET-SHEET] After update, combo '{name}' count: {combo.count()}")
 
         # 资产清单侧默认关键字 (按优先级排序，与常见资产清单列名匹配)
         keyword_groups = [
-            ["一级分类", "一级模块", "建设目标"],     # 一级对应列：优先"一级分类"
-            ["二级分类", "二级模块", "功能模块"],     # 二级对应列：优先"二级分类"
-            ["功能模块", "三级模块", "功能点名称"],   # 三级对应列：优先"功能模块"
+            ["一级分类", "一级模块", "建设目标"],  # 一级对应列：优先"一级分类"
+            ["二级分类", "二级模块", "功能模块"],  # 二级对应列：优先"二级分类"
+            ["功能模块", "三级模块", "功能点名称"],  # 三级对应列：优先"功能模块"
         ]
         for combo, keywords in zip(self.asset_level_combos, keyword_groups):
             found = False
@@ -1725,7 +2218,7 @@ class UploadDialog(QDialog):
                 return
 
             sheet_names = asset_data.get("sheet_names", [])
-            print(f"\n更新资产清单下拉框，工作表: {sheet_names}")
+            log_debug(f'\n更新资产清单下拉框，工作表: {sheet_names}')
 
             self.asset_sheet_combo.blockSignals(True)
             self.asset_sheet_combo.clear()
@@ -1744,14 +2237,14 @@ class UploadDialog(QDialog):
                 self.asset_sheet_combo.setCurrentIndex(default_idx)
                 self.on_asset_sheet_changed(default_idx)
         except Exception as e:
-            print(f"更新资产清单下拉框时出错: {str(e)}")
+            log_error(f'更新资产清单下拉框时出错: {str(e)}')
 
     def update_column_combo(self, combo_box, columns_info, combo_name):
         """更新列下拉框选项"""
-        print(f"\n[COMBO-UPDATE] update_column_combo called for '{combo_name}'")
-        print(f"[COMBO-UPDATE] columns_info length: {len(columns_info)}")
+        log_debug(f"\n[COMBO-UPDATE] update_column_combo called for '{combo_name}'")
+        log_debug(f'[COMBO-UPDATE] columns_info length: {len(columns_info)}')
         if columns_info:
-            print(f"[COMBO-UPDATE] First 3 columns: {[(col['letter'], col['name'], col.get('is_empty')) for col in columns_info[:3]]}")
+            log_debug(f"[COMBO-UPDATE] First 3 columns: {[(col['letter'], col['name'], col.get('is_empty')) for col in columns_info[:3]]}")
 
         combo_box.clear()
 
@@ -1801,7 +2294,7 @@ class UploadDialog(QDialog):
                     combo_box.count() - 1, f"列{letter}: 无数据", Qt.ToolTipRole
                 )
 
-        print(f"[COMBO-UPDATE] {combo_name} 下拉框已更新，共 {added_count} 个有效选项 (total items: {combo_box.count()})")
+        log_debug(f'[COMBO-UPDATE] {combo_name} 下拉框已更新，共 {added_count} 个有效选项 (total items: {combo_box.count()})')
 
         # 应用默认选中项
         if combo_box.count() > 1:  # Index 0 is "Please select..."
@@ -1822,7 +2315,7 @@ class UploadDialog(QDialog):
                 target_idx = 3  # Default to 4th column (index 3)
                 target_keywords = ["三级模块", "三级功能", "模块三", "功能三"]
 
-            print(f"[DEBUG] auto-selecting for {combo_name}, keywords={target_keywords}, fallback_idx={target_idx}")
+            log_debug(f'[DEBUG] auto-selecting for {combo_name}, keywords={target_keywords}, fallback_idx={target_idx}')
 
             found = False
 
@@ -1833,7 +2326,7 @@ class UploadDialog(QDialog):
                     if data and isinstance(data, dict):
                         col_name = str(data.get("name", "")).strip()
                         if any(kw in col_name for kw in target_keywords):
-                            print(f"[DEBUG] Name match found at item {i} ({col_name})")
+                            log_debug(f'[DEBUG] Name match found at item {i} ({col_name})')
                             combo_box.setCurrentIndex(i)
                             found = True
                             break
@@ -1845,32 +2338,32 @@ class UploadDialog(QDialog):
                     if data and isinstance(data, dict):
                         idx = data.get("index")
                         if idx == target_idx:
-                            print(f"[DEBUG] Index match found at item {i}")
+                            log_debug(f'[DEBUG] Index match found at item {i}')
                             combo_box.setCurrentIndex(i)
                             found = True
                             break
 
             # Strategy 3: Default to First Available (Last Resort)
             if not found:
-                print("[DEBUG] No match found, falling back to index 1")
+                log_debug('[DEBUG] No match found, falling back to index 1')
                 combo_box.setCurrentIndex(1)
 
     def on_simple_sheet_changed(self, index):
         """简单模式：工作表变更时更新列下拉框和列信息显示"""
-        print(f"\n[SIMPLE-SHEET] on_simple_sheet_changed called, index={index}")
+        log_debug(f'\n[SIMPLE-SHEET] on_simple_sheet_changed called, index={index}')
         if index < 0:
             return
 
         # 获取选中的工作表名称
         sheet_name = self.simple_excel_combo.itemData(index)
-        print(f"[SIMPLE-SHEET] itemData({index}) = '{sheet_name}'")
+        log_debug(f"[SIMPLE-SHEET] itemData({index}) = '{sheet_name}'")
         if not sheet_name:
             sheet_name = self.simple_excel_combo.itemText(index)
-            print(f"[SIMPLE-SHEET] Fallback to itemText: '{sheet_name}'")
+            log_debug(f"[SIMPLE-SHEET] Fallback to itemText: '{sheet_name}'")
             # 从显示文本中提取工作表名称
             if "、" in sheet_name:
                 sheet_name = sheet_name.split("、", 1)[1]
-                print(f"[SIMPLE-SHEET] Extracted sheet name: '{sheet_name}'")
+                log_debug(f"[SIMPLE-SHEET] Extracted sheet name: '{sheet_name}'")
 
         # 获取第一个有效的Excel文件信息
         excel_key = None
@@ -1879,97 +2372,30 @@ class UploadDialog(QDialog):
                 excel_key = key
                 break
 
-        print(f"[SIMPLE-SHEET] Selected excel_key: {excel_key}")
+        log_debug(f'[SIMPLE-SHEET] Selected excel_key: {excel_key}')
         if not excel_key:
-            print("[SIMPLE-SHEET] No valid Excel key, returning early")
+            log_debug('[SIMPLE-SHEET] No valid Excel key, returning early')
             return
 
         # 获取该工作表的列信息
         excel_data = self.excel_info.get(excel_key)
-        print(f"[SIMPLE-SHEET] Excel data keys: {list(excel_data.keys()) if excel_data else None}")
+        log_debug(f'[SIMPLE-SHEET] Excel data keys: {(list(excel_data.keys()) if excel_data else None)}')
         if not excel_data:
-            print("[SIMPLE-SHEET] No excel data, returning early")
+            log_debug('[SIMPLE-SHEET] No excel data, returning early')
             return
 
         columns_info = excel_data.get("columns_info", {}).get(sheet_name, [])
-        print(f"[SIMPLE-SHEET] Columns for sheet '{sheet_name}': {len(columns_info)} columns")
+        log_debug(f"[SIMPLE-SHEET] Columns for sheet '{sheet_name}': {len(columns_info)} columns")
         if columns_info:
-            print(f"[SIMPLE-SHEET] Column details: {[(col['letter'], col['name']) for col in columns_info[:5]]}")
+            log_debug(f"[SIMPLE-SHEET] Column details: {[(col['letter'], col['name']) for col in columns_info[:5]]}")
 
-        print(f"\n简单模式：工作表 '{sheet_name}' 变更，更新功能点列下拉框")
-        print(f"列信息: {[(col['letter'], col['name']) for col in columns_info]}")
+        log_debug(f"\n简单模式：工作表 '{sheet_name}' 变更，更新功能点列下拉框")
+        log_info(f"列信息: {[(col['letter'], col['name']) for col in columns_info]}")
 
         # 更新功能点列下拉框
         self.update_column_combo(self.func_combo, columns_info, "功能点列")
 
-    def clean_filename(self, filename):
-        """
-        全量清理：去掉前缀附件序号、末尾冗余词（项目、说明书等），提取纯净项目名
-        """
-        # 1. 基础处理：取文件名，先移除扩展名 (.docx, .doc, .xlsx)
-        name = os.path.basename(filename).strip()
-        for ext in [".docx", ".doc", ".xlsx", ".XLSX", ".DOCX"]:
-            if name.lower().endswith(ext.lower()):
-                name = name[: -len(ext)].strip()
-                break
 
-        # 2. 精准去掉序号前缀（如 1. 或 附件1：）
-        # 先处理附件前缀
-        name = re.sub(r"^附件\s*\d+\s*[：:.\-\s]*\s*", "", name)
-        # 再处理纯数字点前缀 (如 1. 或 1．)
-        # 匹配 1-3位数字 + 点 + 可选空格。1-3位是为了避开 2024. 这种年份开头
-        name = re.sub(r"^\d{1,3}[\.．]\s*", "", name)
-        name = name.strip()
-
-        # 3. 循环清理末尾后缀，确保切干净
-        while True:
-            prev_name = name
-
-            # (a) 精确匹配末尾的冗余词
-            suffixes = [
-                "产品需求说明书",
-                "需求规格说明书",
-                "需求规格书",
-                "需求说明书",
-                "规格说明书",
-                "规格书",
-                "功能点拆分表",
-                "功能拆分表",
-                "拆分表",
-                "资产清单",
-                "审计方案",
-                "测试用例",
-                "说明书",
-                "文档",
-                "需求",
-            ]
-            for s in suffixes:
-                if name.endswith(s):
-                    # 只有当剥离后的长度仍然合理时才剥离
-                    new_n = name[: -len(s)].strip()
-                    if len(new_n) >= 2:
-                        name = new_n
-
-            # (b) 去掉版本号、日期、以及 (1) (2) 这种重复标识
-            name = re.sub(r"[vV]\d+(?:\.\d+)*\s*$", "", name)
-            # 只有当日期在末尾时才去掉
-            name = re.sub(r"(?:20)?\d{6,8}\s*$", "", name)
-            # 处理副本标识，如 (1), （1）, - 副本
-            name = re.sub(r"[\(（]\d+[\)）]\s*$", "", name)
-            name = re.sub(r"\s*-\s*副本\s*$", "", name)
-
-            # (c) 去掉末尾的悬空连接词
-            name = re.sub(
-                r"(?:的项目|项目|的需求|的产品|产品|的|之)+$", "", name
-            ).strip()
-
-            # (d) 去掉悬空的标点
-            name = name.strip(" :：-－_|'\"().（）")
-
-            if name == prev_name:
-                break
-
-        return name
 
     def _is_fuzzy_match(self, name1, name2):
         """
@@ -1993,7 +2419,7 @@ class UploadDialog(QDialog):
         for i in range(len(n1) - min_len + 1):
             window = n1[i: i + min_len]
             if window in n2:
-                print(f"[匹配成功] 发现共同片段: '{window}'")
+                log_info(f"[匹配成功] 发现共同片段: '{window}'")
                 return True
         return False
 
@@ -2038,27 +2464,32 @@ class UploadDialog(QDialog):
                 valid_count += 1
 
         self.queue_container.addStretch()
-        
+
         # 智能更新校验节点勾选状态
         self.auto_update_checkboxes()
 
     def auto_update_checkboxes(self):
         """根据上传的文件类型自动更新校验节点勾选状态"""
+        # [FIX] 重新初评预填期间，拆分表/资产清单异步解析完成都会触发本方法，
+        #       不能按“当前有哪些文件”覆盖刚恢复的历史节点勾选状态
+        #       （尤其 asset_checkbox 会被 has_any_asset=False 强制改回未勾选）
+        if getattr(self, "_prefill_active", False):
+            return
         if not self.file_queue:
             return
-        
+
         # 检查是否有任意项目包含Word文档、拆分表、资产清单
         has_any_word = any(v["has_word"] for v in self.file_queue.values())
         has_any_excel = any(v["has_excel"] for v in self.file_queue.values())
         has_any_asset = any(v.get("has_asset", False) for v in self.file_queue.values())
-        
+
         # 规则1: Word文档(需规) → 模板校验、附加因子、层级匹配、功能过程
         if has_any_word:
             self.check_template.setChecked(True)
             self.check_factors.setChecked(True)
             self.hierarchy_checkbox.setChecked(True)
             self.simple_checkbox.setChecked(True)
-        
+
         # 规则2: 拆分表(Excel) → 空值检查、送审比例、层级匹配、功能过程、数据移动类型、资产清单匹配、数据属性重复检测
         if has_any_excel:
             self.check_empty.setChecked(True)
@@ -2068,7 +2499,7 @@ class UploadDialog(QDialog):
             self.dm_checkbox.setChecked(True)
             self.asset_checkbox.setChecked(has_any_asset)  # 有资产清单才勾选
             self.data_attr_checkbox.setChecked(True)
-        
+
         # 规则3: 资产清单 → 资产清单匹配
         if has_any_asset and not has_any_excel:
             # 只有资产清单没有拆分表时，只勾选资产清单匹配
@@ -2078,18 +2509,18 @@ class UploadDialog(QDialog):
             self.check_ratio.setChecked(False)
             self.dm_checkbox.setChecked(False)
             self.data_attr_checkbox.setChecked(False)
-        
+
         # 如果没有Word文档，取消相关节点
         if not has_any_word:
             self.check_template.setChecked(False)
             self.check_factors.setChecked(False)
-        
+
         # 触发设置区域显隐更新
         self.on_mode_checkbox_changed(0)
 
     def validate_checkboxes(self):
         """验证勾选的节点是否有必要的文件支持
-        
+
         Returns:
             dict: {
                 'valid': bool,
@@ -2098,14 +2529,14 @@ class UploadDialog(QDialog):
         """
         if not self.file_queue:
             return {"valid": False, "message": "请先上传文件！"}
-        
+
         # 检查是否有任意项目包含Word文档、拆分表、资产清单
         has_any_word = any(v["has_word"] for v in self.file_queue.values())
         has_any_excel = any(v["has_excel"] for v in self.file_queue.values())
         has_any_asset = any(v.get("has_asset", False) for v in self.file_queue.values())
-        
+
         missing_files = []
-        
+
         # Word文档相关节点验证
         word_nodes = [
             (self.check_template, "1. 模板校验"),
@@ -2114,16 +2545,16 @@ class UploadDialog(QDialog):
         for checkbox, node_name in word_nodes:
             if checkbox.isChecked() and not has_any_word:
                 missing_files.append(f"【{node_name}】需要上传需求说明书(Word文档)")
-        
+
         # 层级匹配和功能过程需要Word或Excel
         if self.hierarchy_checkbox.isChecked():
             if not has_any_word and not has_any_excel:
                 missing_files.append("【5. 层级匹配】需要上传需求说明书或功能点拆分表")
-        
+
         if self.simple_checkbox.isChecked():
             if not has_any_word and not has_any_excel:
                 missing_files.append("【6. 功能过程】需要上传需求说明书或功能点拆分表")
-        
+
         # 拆分表相关节点验证
         excel_nodes = [
             (self.check_empty, "2. 空值检查"),
@@ -2134,15 +2565,15 @@ class UploadDialog(QDialog):
         for checkbox, node_name in excel_nodes:
             if checkbox.isChecked() and not has_any_excel:
                 missing_files.append(f"【{node_name}】需要上传功能点拆分表(Excel)")
-        
+
         # 资产清单匹配验证
         if self.asset_checkbox.isChecked() and not has_any_asset:
             missing_files.append("【8. 资产清单匹配】需要上传资产清单(Excel)")
-        
+
         if missing_files:
             message = "以下节点缺少必要文件，请先上传对应文件：\n\n" + "\n".join(missing_files)
             return {"valid": False, "message": message}
-        
+
         return {"valid": True, "message": ""}
 
     def select_all_nodes(self):
@@ -2176,24 +2607,78 @@ class UploadDialog(QDialog):
     def remove_file(self, cleaned_name):
         """删除文件（使用清理后的文件名）"""
         if cleaned_name in self.file_queue:
+            # 删除前先检查是否是最后一个文件
+            is_last_file = len(self.file_queue) == 1
+
+            # 如果是最后一个文件，清理相关缓存和文件夹
+            if is_last_file:
+                self._cleanup_project_files(cleaned_name)
+
+            # 从队列中删除
             del self.file_queue[cleaned_name]
+
             # 同时删除所有相关的解析数据
             if cleaned_name in self.excel_info:
                 del self.excel_info[cleaned_name]
             if cleaned_name in self.asset_info:
                 del self.asset_info[cleaned_name]
+
             self.update_queue_display()
             # ✅ 新增：触发 UI 联动刷新
             self.refresh_ui_after_file_change()
 
+    def _cleanup_project_files(self, project_name):
+        """清理项目相关的缓存文件和文件夹"""
+        import os
+        import shutil
+        from utils.initial_review_report import project_output_dir
+
+        try:
+            # 1. 删除 tree-cache 文件（Word结构树缓存）
+            cache_file = os.path.join(os.getcwd(), f"{project_name}-tree_cache.json")
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+                log_info(f'[INFO] 已删除缓存文件: {cache_file}')
+
+            # 2. 删除项目文件夹（如果存在）
+            project_dir = project_output_dir(project_name)
+            if project_dir and os.path.exists(project_dir):
+                # 检查文件夹是否为空或只包含缓存文件
+                try:
+                    shutil.rmtree(project_dir)
+                    log_info(f'[INFO] 已删除项目文件夹: {project_dir}')
+                except Exception as e:
+                    log_warn(f'[WARN] 删除项目文件夹失败: {e}')
+            # 3. 清理日志文件（可选）——仅该项目自己的日志目录，不触碰应用日志
+            from utils.runtime_logger import RuntimeLogger
+            log_dir = RuntimeLogger.get_log_dir(project_name=project_name)
+            if log_dir and os.path.exists(log_dir):
+                # 删除与项目相关的日志文件
+                for f in os.listdir(log_dir):
+                    if project_name in f and f.endswith('.log'):
+                        log_file = os.path.join(log_dir, f)
+                        try:
+                            os.remove(log_file)
+                            log_info(f'[INFO] 已删除日志文件: {log_file}')
+                        except Exception as e:
+                            log_warn(f'[WARN] 删除日志文件失败: {e}')
+        except Exception as e:
+            log_error(f'[ERROR] 清理项目文件时出错: {e}')
+
     def clear_all(self):
         """清除所有"""
+        # [FIX] 清空后恢复"按文件自动勾选节点"的规则
+        self._prefill_active = False
+
+        # 清理所有项目的缓存和文件夹
+        for project_name in list(self.file_queue.keys()):
+            self._cleanup_project_files(project_name)
+
         self.file_queue.clear()
         self.excel_info.clear()
         self.asset_info.clear()  # ✅ 修复：遗漏了清空资产信息
         self.update_queue_display()
         self.days_input.clear()
-
         # ✅ 修复：不再手动添加 ["0", "1", "2"] 等无意义数据，统一调用刷新方法重置
         self.refresh_ui_after_file_change()
 
@@ -2259,7 +2744,7 @@ class UploadDialog(QDialog):
 
     def start_review(self):
         """开始审核"""
-        # 验证勾选的节点是否有必要的文件支持
+        # 1. 验证勾选的节点是否有必要的文件支持
         validation_result = self.validate_checkboxes()
         if not validation_result["valid"]:
             QMessageBox.warning(
@@ -2268,7 +2753,8 @@ class UploadDialog(QDialog):
                 validation_result["message"]
             )
             return
-        # 只有在选择了"送审比例"节点时，才必须输入线上送审人天
+
+        # 2. 只有在选择了"送审比例"节点时，才必须输入线上送审人天
         if self.check_ratio.isChecked() and not self.days_input.text().strip():
             QMessageBox.warning(
                 self,
@@ -2286,28 +2772,37 @@ class UploadDialog(QDialog):
                     background-color: #450a0a;
                     color: #fca5a5;
                 }
-            """
+                """
             )
             return
+
         # 重置样式（如果之前报错过）
         self.days_input.setStyleSheet("")
-        # 有效文件：有拆分表的条目（Word可选，资产清单可选）
-        valid_files = [
-            k for k, v in self.file_queue.items() if v["has_excel"]
-        ]
+
+        # 3. 有效文件：有拆分表的条目（Word可选，资产清单可选）
+        valid_files = [k for k, v in self.file_queue.items() if v["has_excel"]]
         if not valid_files:
             QMessageBox.warning(self, "警告", "没有有效的配对文件！")
             return
-        # 使用第一个配对文件的词条作为显示名，并经过深度清洗
-        display_name = valid_files[0]
-        if valid_files[0] in self.file_queue:
+
+        # 4. 【核心修改】：确定项目名称 (优先使用用户输入框的值)
+        custom_name = ""
+        if hasattr(self, 'project_name_input'):
+            custom_name = self.project_name_input.text().strip()
+
+        if custom_name:
+            display_name = custom_name
+            log_info(f'[OK] 使用用户自定义项目名称: {display_name}')
+        else:
+            # 回退逻辑：从文件名提取
             word_name = self.file_queue[valid_files[0]]["original_names"]["word"]
             if word_name:
-                display_name = self.clean_filename(word_name)
+                display_name = clean_project_name(word_name)
             else:
-                # 如果没Word，清洗索引Key
-                display_name = self.clean_filename(valid_files[0])
-        # 获取选中列的表头行信息（转换为 1-based）
+                display_name = clean_project_name(valid_files[0])
+            log_info(f'[INFO] 使用文件名提取的项目名称: {display_name}')
+
+        # 5. 获取选中列的表头行信息（转换为 1-based）
         func_col_info = self.func_combo.currentData()
         level1_col_info = self.level1_combo.currentData()
         func_header_row = 1  # Default to row 1 (1-based)
@@ -2316,7 +2811,8 @@ class UploadDialog(QDialog):
         hier_header_row = 1  # Default to row 1 (1-based)
         if isinstance(level1_col_info, dict):
             hier_header_row = level1_col_info.get("header_row", 0) + 1  # Convert 0-based to 1-based
-        # 获取选中列的索引信息
+
+        # 6. 获取选中列的索引信息
         func_col_idx = 6  # Default
         if isinstance(func_col_info, dict):
             func_col_idx = func_col_info.get("index", 6)
@@ -2331,10 +2827,12 @@ class UploadDialog(QDialog):
         l3_col_idx = 3  # Default
         if isinstance(l3_col_info, dict):
             l3_col_idx = l3_col_info.get("index", 3)
-        # 获取选中的工作表名称 (分别针对两种模式)
+
+        # 7. 获取选中的工作表名称 (分别针对两种模式)
         hierarchy_sheet = self.excel_sheet_combo.currentData()
         simple_sheet = self.simple_excel_combo.currentData()
-        # 获取资产清单配置
+
+        # 8. 获取资产清单配置
         asset_sheet = None
         asset_level1_idx = None
         asset_level2_idx = None
@@ -2342,7 +2840,7 @@ class UploadDialog(QDialog):
         asset_header_row = None
         if self.asset_checkbox.isChecked() and hasattr(self, 'asset_sheet_combo'):
             asset_sheet = self.asset_sheet_combo.currentData()
-            print(f"[DEBUG] Asset sheet selected: {asset_sheet}")
+            log_debug(f'[DEBUG] Asset sheet selected: {asset_sheet}')
             # 获取资产清单三个层级的列索引和表头行（header_row 转换为 1-based）
             for i, combo in enumerate(self.asset_level_combos):
                 col_info = combo.currentData()
@@ -2357,18 +2855,15 @@ class UploadDialog(QDialog):
                         asset_level2_idx = col_idx
                     elif i == 2:
                         asset_level3_idx = col_idx
-            print(
-                f"[DEBUG] Asset config: sheet={asset_sheet}, L1={asset_level1_idx}, L2={asset_level2_idx}, L3={asset_level3_idx}, header_row={asset_header_row} (1-based)")
-        print(
-            f"[DEBUG] start_review: func_col_idx={func_col_idx}, func_header_row={func_header_row}, simple_sheet={simple_sheet}, hierarchy_sheet={hierarchy_sheet}"
-        )
-        # 收集资产清单文件：优先取与拆分表同项目条目的，否则取全局第一个
+
+        # 9. 收集资产清单文件：优先取与拆分表同项目条目的，否则取全局第一个
         asset_excel_path = None
         for key, info in self.file_queue.items():
             if info.get("has_asset") and info["file_paths"].get("asset"):
                 if not asset_excel_path:
                     asset_excel_path = info["file_paths"]["asset"]
-        # 为每个有拆分表的条目补充 asset 路径（同条目优先，其次全局兜底）
+
+        # 10. 为每个有拆分表的条目补充 asset 路径（同条目优先，其次全局兜底）
         file_pairs = []
         for key, info in self.file_queue.items():
             if info["has_excel"]:
@@ -2381,8 +2876,10 @@ class UploadDialog(QDialog):
                         "excel_sheets": info.get("worksheets", []),
                     }
                 )
+
+        # 11. 构建最终的任务信息字典
         task_info = {
-            "filename": display_name,
+            "filename": display_name,  # <--- 这里使用了统一后的 display_name
             "days": self.days_input.text(),
             "file_pairs": file_pairs,
             "excel_columns": {
@@ -2432,15 +2929,20 @@ class UploadDialog(QDialog):
             # ================= 【新增】传递自动编号配置 =================
             "auto_numbering": self.auto_numbering_check.isChecked(),
             # ============================================================
+            # [NEW] 导入的目录树txt（可选），供第0步跳过结构解析
+            "tree_txt": getattr(self, "tree_txt_path", ""),
         }
-        # [优化] 先关闭对话框，立即将控制权交还主界面，避免视觉卡顿
+
+        # 12. [优化] 先关闭对话框，立即将控制权交还主界面，避免视觉卡顿
         self.accept()
+
         # [NEW] 使用 QTimer.singleShot 异步发射信号，确保对话框已经从主循环中完全退出
         # 解决"点击开始审核不会马上开始"的阻塞感
         from PySide6.QtCore import QTimer
         QTimer.singleShot(50, lambda: self.task_submitted.emit(task_info))
+
         # 记录日志
-        print(f"[OK] 已通过信号异步添加任务：{display_name}")
+        log_info(f'[OK] 已通过信号异步添加任务：{display_name}')
 
 
 class ImageSelectionDialog(QDialog):

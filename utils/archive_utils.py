@@ -4,6 +4,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from typing import List
+from utils.runtime_logger import log_error, log_info
 
 
 class ArchiveUtils:
@@ -132,10 +133,10 @@ class ArchiveUtils:
                                      sub_dir = os.path.join(r, os.path.splitext(file)[0] + "_content")
                                      pending_archives.append((full_p, sub_dir))
                     else:
-                        print(f"[ARCHIVE] 未找到 WinRAR 或 7-Zip，无法解压: {current_archive}")
+                        log_info(f'[ARCHIVE] 未找到 WinRAR 或 7-Zip，无法解压: {current_archive}')
 
             except Exception as e:
-                print(f"解压失败 {current_archive}: {e}")
+                log_error(f'解压失败 {current_archive}: {e}')
         
         # 遍历最终的所有文件
         valid_exts = [".doc", ".docx", ".xls", ".xlsx"]

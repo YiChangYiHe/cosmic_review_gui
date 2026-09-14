@@ -2,6 +2,8 @@
 import sys
 import os
 import traceback
+from utils.app_logger import ApplicationLogger
+
 
 # ==========================================================
 # 0. PyInstaller 打包环境兼容性修复 (核心：解决图标/字体不显示)
@@ -40,7 +42,7 @@ try:
 
     from ui.main_window import CosmicMainWindow
     from utils.path_utils import get_resource_path
-    from utils.runtime_logger import RuntimeLogger
+    from utils.runtime_logger import RuntimeLogger, log_error, log_warn
     from extend.matcher_config import MatcherConfig
 except ImportError as e:
     print(f"核心组件加载失败: {e}")
@@ -58,6 +60,24 @@ except ImportError as e:
 
 def main():
     """主程序入口"""
+    # 【新增】应用用户设置的日志级别（须在写第一条日志前生效）
+    try:
+        RuntimeLogger.set_log_level(MatcherConfig.load().get("log_level", "INFO"))
+    except Exception:
+        RuntimeLogger.set_log_level("INFO")
+
+    # 【新增】初始化全局应用日志
+    ApplicationLogger.log_startup(version="1.0.0")
+
+    # 【新增】配置全局异常处理器
+    def global_exception_handler(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        ApplicationLogger.log_exception(exc_value, "未捕获的全局异常")
+
+    sys.excepthook = global_exception_handler
+
     # 1. 设置高 DPI 缩放策略 (必须在 QApplication 实例化前)
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -65,49 +85,83 @@ def main():
 
     # 2. 创建应用实例
     app = QApplication(sys.argv)
+    app.setApplicationName("COSMIC智能评估")
+
+    # 【新增】接管 Qt 内部消息（含 qFatal 致命错误）。Qt 的致命错误走 C 层
+    # stderr，Python 的 stdout 重定向捕获不到；不接管的话闪退时没有任何线索。
+    # 典型致命错误: "QThread: Destroyed while thread is still running"
+    from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+
+    def _qt_message_handler(msg_type, context, message):
+        try:
+            # 样式表的 "Unknown property transition/transform" 警告数量巨大
+            # （QSS 里写了 Qt 不认识的 CSS 动画属性），降为 DEBUG 防止刷屏
+            if "Unknown property" in message:
+                label = "DEBUG"
+            else:
+                label = {
+                    QtMsgType.QtDebugMsg: "DEBUG",
+                    QtMsgType.QtInfoMsg: "INFO",
+                    QtMsgType.QtWarningMsg: "WARN",
+                    QtMsgType.QtCriticalMsg: "ERROR",
+                    QtMsgType.QtFatalMsg: "FATAL",
+                }.get(msg_type, "INFO")
+            loc = ""
+            if context is not None and context.file:
+                loc = f" ({context.file}:{context.line})"
+            ApplicationLogger.log_qt_message(label, f"[Qt] {message}{loc}")
+        except Exception:
+            pass
+
+    qInstallMessageHandler(_qt_message_handler)
 
     # 3. 设置全局样式 (Fusion 样式在不同平台上表现更一致)
     app.setStyle("Fusion")
 
-    # 4. 设置全局默认字体 (解决部分 Windows 环境下字体渲染发虚或默认字体不对的问题)
-    # 优先使用微软雅黑，如果系统没有则回退到系统默认
+    # 4. 设置全局默认字体
     font = QFont("Microsoft YaHei UI", 9)
     if not font.exactMatch():
         font = QFont("Microsoft YaHei", 9)
     app.setFont(font)
 
-    # 5. 设置应用图标 (兼容打包环境，使用 get_resource_path)
+    # 5. 设置应用图标
     try:
-        # 尝试加载 .ico 或 .png 格式的图标
         icon_path = get_resource_path("ui/logo.png")
         if not os.path.exists(icon_path):
             icon_path = get_resource_path("ui/logo.ico")
-
         if os.path.exists(icon_path):
             app_icon = QIcon(icon_path)
             app.setWindowIcon(app_icon)
         else:
-            print(f"警告: 未找到应用图标文件: {icon_path}")
+            log_warn(f"警告: 未找到应用图标文件: {icon_path}")
     except Exception as e:
-        print(f"设置应用图标时发生异常: {e}")
+        log_error(f"设置应用图标时发生异常: {e}")
+        ApplicationLogger.log_exception(e, "设置应用图标")
 
     # 6. 创建并显示主窗口
     try:
         window = CosmicMainWindow()
         window.show()
+        ApplicationLogger.log_thread_event("MainThread", "主窗口创建成功")
     except Exception as e:
-        print(f"主窗口初始化失败: {e}")
-        traceback.print_exc()
+        log_error(f"主窗口初始化失败: {e}")
+        log_error(traceback.format_exc())
+        ApplicationLogger.log_exception(e, "主窗口初始化")
         return 1
 
     # 7. 启动事件循环
-    return app.exec()
+    try:
+        exit_code = app.exec()
+        ApplicationLogger.log_shutdown()
+        return exit_code
+    except Exception as e:
+        ApplicationLogger.log_exception(e, "应用运行异常")
+        return 1
 
 
 if __name__ == "__main__":
-    # 启动全局日志会话
+    # 1. 启动全局日志会话
     RuntimeLogger.start_session()
-
     try:
         # 执行主程序
         exit_code = main()
